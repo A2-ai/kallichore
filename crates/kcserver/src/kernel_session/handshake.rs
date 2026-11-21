@@ -11,10 +11,9 @@
 use async_channel::{Receiver, Sender};
 use kallichore_api::models::{ConnectionInfo, StartupError};
 use kcshared::{
-    handshake_protocol::HandshakeStatus, kernel_message::KernelMessage,
+    handshake_protocol::HandshakeRequest, kernel_message::KernelMessage,
     websocket_message::WebsocketMessage,
 };
-use tokio::sync::oneshot;
 
 use crate::{
     connection_file::ConnectionFile,
@@ -22,7 +21,7 @@ use crate::{
     kernel_connection::KernelConnection,
     kernel_session::utils::strip_startup_markers,
     registration_file::RegistrationFile,
-    registration_socket::{HandshakeResult, RegistrationSocket},
+    registration_socket::RegistrationSocket,
     startup_status::StartupStatus,
 };
 
@@ -72,21 +71,11 @@ impl HandshakeCoordinator {
     /// A tuple containing:
     /// - The path to the registration file
     /// - The registration socket
-    /// - A channel to receive the handshake result
     pub async fn setup_registration_socket(
         &self,
-    ) -> Result<
-        (
-            std::path::PathBuf,
-            RegistrationSocket,
-            oneshot::Receiver<HandshakeResult>,
-        ),
-        StartupError,
-    > {
-        let (handshake_result_tx, handshake_result_rx) = oneshot::channel();
-
+    ) -> Result<(std::path::PathBuf, RegistrationSocket), StartupError> {
         // Create a registration socket that immediately binds to an OS-selected port
-        let registration_socket = match RegistrationSocket::new(handshake_result_tx).await {
+        let registration_socket = match RegistrationSocket::new().await {
             Ok(socket) => socket,
             Err(e) => {
                 return Err(StartupError {
@@ -140,76 +129,30 @@ impl HandshakeCoordinator {
             registration_port
         );
 
-        Ok((registration_path, registration_socket, handshake_result_rx))
+        Ok((registration_path, registration_socket))
     }
 
     /// Wait for a handshake to be completed.
     ///
     /// This is used when starting a kernel that supports JEP 66 handshaking.
+    /// Whatever the outcome, the registration socket is closed and its port
+    /// released before this returns.
     ///
     /// # Arguments
     ///
     /// * `registration_socket` - The socket to use for the handshake procedure
-    /// * `handshake_result_rx` - The channel to receive the handshake result over
     /// * `startup_rx` - The channel to receive startup status messages (including kernel exits)
     /// * `timeout_secs` - Time to wait for the handshake in seconds
     pub async fn wait_for_handshake(
         &self,
-        registration_socket: RegistrationSocket,
-        handshake_result_rx: oneshot::Receiver<HandshakeResult>,
+        mut registration_socket: RegistrationSocket,
         startup_rx: Receiver<StartupStatus>,
         timeout_secs: u64,
     ) -> Result<ConnectionFile, StartupError> {
-        // Start listening on the registration socket in a separate thread
-        registration_socket.listen(self.connection.clone());
-
-        // Create a channel to listen for the handshake completed event
-        let (handshake_tx, result_rx) = async_channel::bounded::<ConnectionFile>(1);
-
-        // Monitor for handshake results from the registration socket
-        let session_id = self.session_id.clone();
-        let connection_key = match &self.connection.key {
-            Some(key) => key.clone(),
-            None => String::new(),
-        };
-
-        tokio::spawn(async move {
-            if let Ok(result) = handshake_result_rx.await {
-                if result.status == HandshakeStatus::Ok {
-                    // Create connection info from the handshake request
-                    let info = ConnectionInfo {
-                        shell_port: result.request.shell_port as i32,
-                        iopub_port: result.request.iopub_port as i32,
-                        stdin_port: result.request.stdin_port as i32,
-                        control_port: result.request.control_port as i32,
-                        hb_port: result.request.hb_port as i32,
-                        transport: "tcp".to_string(),
-                        signature_scheme: "hmac-sha256".to_string(),
-                        key: connection_key,
-                        ip: "127.0.0.1".to_string(),
-                    };
-
-                    // Create a connection file from the connection info
-                    let connection_file = ConnectionFile::from_info(info);
-
-                    // Send the connection file to the waiting thread
-                    if let Err(e) = handshake_tx.send(connection_file).await {
-                        log::warn!(
-                            "[session {}] Failed to send handshake result: {}",
-                            session_id,
-                            e
-                        );
-                    }
-                } else {
-                    log::warn!("[session {}] Received failed handshake result", session_id);
-                }
-            }
-        });
-
         // Wait for the handshake to complete, kernel exit, or timeout
         let result = tokio::select! {
-            handshake_result = result_rx.recv() => {
-                self.handle_handshake_result(handshake_result).await
+            handshake = registration_socket.handshake(&self.connection) => {
+                self.handle_handshake_result(handshake).await
             }
             startup_status = startup_rx.recv() => {
                 self.handle_startup_during_handshake(startup_status)
@@ -219,28 +162,40 @@ impl HandshakeCoordinator {
             }
         };
 
+        registration_socket.close().await;
+
         result
     }
 
-    /// Handle a successful handshake result.
+    /// Handle the outcome of the handshake on the registration socket.
     async fn handle_handshake_result(
         &self,
-        handshake_result: Result<ConnectionFile, async_channel::RecvError>,
+        handshake: Result<HandshakeRequest, anyhow::Error>,
     ) -> Result<ConnectionFile, StartupError> {
-        match handshake_result {
-            Ok(connection_file) => {
+        match handshake {
+            Ok(request) => {
                 // Handshake completed successfully
                 log::info!(
                     "[session {}] Handshake completed successfully",
                     self.session_id
                 );
 
-                // Create a new connection file with the key included
-                let mut connection_file = connection_file;
-                connection_file.info.key = match &self.connection.key {
-                    Some(key) => key.clone(),
-                    None => String::new(),
-                };
+                // Create a connection file from the ports the kernel
+                // registered, with the key included
+                let connection_file = ConnectionFile::from_info(ConnectionInfo {
+                    shell_port: request.shell_port as i32,
+                    iopub_port: request.iopub_port as i32,
+                    stdin_port: request.stdin_port as i32,
+                    control_port: request.control_port as i32,
+                    hb_port: request.hb_port as i32,
+                    transport: "tcp".to_string(),
+                    signature_scheme: "hmac-sha256".to_string(),
+                    key: match &self.connection.key {
+                        Some(key) => key.clone(),
+                        None => String::new(),
+                    },
+                    ip: "127.0.0.1".to_string(),
+                });
 
                 // Create an event message to send through the websocket
                 let msg = WebsocketMessage::Kernel(KernelMessage::HandshakeCompleted(
@@ -260,15 +215,14 @@ impl HandshakeCoordinator {
                 Ok(connection_file)
             }
             Err(e) => {
-                // Error receiving from channel
                 log::error!(
-                    "[session {}] Error waiting for handshake: {}",
+                    "[session {}] The handshake failed: {:#}",
                     self.session_id,
                     e
                 );
                 Err(self.ks_error_to_startup_error(KSError::HandshakeFailed(
                     self.session_id.clone(),
-                    anyhow::anyhow!("Channel error: {}", e),
+                    e,
                 )))
             }
         }

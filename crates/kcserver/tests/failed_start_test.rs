@@ -263,6 +263,92 @@ async fn test_start_that_fails_before_launch_leaves_an_exited_session() {
     drop(server);
 }
 
+/// Whether anything accepts a connection on a local port.
+async fn port_is_open(port: u16) -> bool {
+    tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .is_ok()
+}
+
+/// Starts a session with the handshake (protocol 5.5) whose "kernel" never
+/// registers, and checks that once the start has failed the port the kernel
+/// was to register on is closed.
+#[cfg(unix)]
+async fn check_failed_handshake_releases_the_registration_port(kernel_command: &str) {
+    let server = TestServer::start().await;
+    let client = server.create_client().await;
+
+    let session_id = format!("failed-start-test-{}", Uuid::new_v4());
+    let mut session = create_test_session(session_id.clone(), "/bin/sh");
+    session.argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        kernel_command.to_string(),
+        "{connection_file}".to_string(),
+    ];
+    session.connection_timeout = Some(2);
+    session.protocol_version = Some("5.5".to_string());
+    create_session_with_client(&client, session).await;
+
+    let response = client
+        .start_session(session_id.clone())
+        .await
+        .expect("start request failed");
+    assert!(
+        matches!(
+            response,
+            kallichore_api::StartSessionResponse::StartFailed(_)
+        ),
+        "expected the start to fail, got {:?}",
+        response
+    );
+
+    // The file the kernel was given names the port
+    let registration_file =
+        std::env::temp_dir().join(format!("registration_{}.json", session_id));
+    let registration: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&registration_file).expect("the registration file should exist"),
+    )
+    .expect("the registration file should be JSON");
+    let port = registration["registration_port"]
+        .as_u64()
+        .expect("the registration file should name a port") as u16;
+
+    assert!(
+        !port_is_open(port).await,
+        "port {} should be closed once the start has failed",
+        port
+    );
+
+    check_session_can_be_deleted(&client, &session_id).await;
+    drop(server);
+}
+
+/// A kernel that is running and never registers: the start fails on the
+/// session's connection timeout.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_failed_handshake_releases_the_registration_port_timeout() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        check_failed_handshake_releases_the_registration_port("exec sleep 60"),
+    )
+    .await
+    .expect("test timed out");
+}
+
+/// A kernel whose command exits at once: the start fails on the exit.
+#[cfg(unix)]
+#[tokio::test]
+async fn test_failed_handshake_releases_the_registration_port_exit() {
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        check_failed_handshake_releases_the_registration_port("exit 3"),
+    )
+    .await
+    .expect("test timed out");
+}
+
 /// Binds a socket to a port of the system's choosing and returns the port.
 async fn bind_to_free_port<S: Socket>(socket: &mut S) -> i32 {
     match socket
