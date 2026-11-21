@@ -7,7 +7,7 @@
 //
 
 use async_channel::{Receiver, Sender};
-use event_listener::Event;
+use event_listener::{Event, EventListener};
 use futures::{stream, StreamExt};
 use kallichore_api::models;
 use kcshared::{
@@ -44,7 +44,6 @@ pub struct ZmqWsProxy {
     pub closed: bool,
     pub ws_json_tx: Sender<WebsocketMessage>,
     pub ws_zmq_rx: Receiver<JupyterMessage>,
-    pub exit_event: Arc<Event>,
     pub disconnected_event: Arc<Event>,
     pub state: Arc<RwLock<KernelState>>,
     pub pending_iopub_messages: Vec<ZmqMessage>,
@@ -87,8 +86,8 @@ impl ZmqWsProxy {
     /// - `state`: The current state of the kernel
     /// - `ws_json_tx`: A channel to send JSON messages to the WebSocket
     /// - `ws_zmq_rx`: A channel to receive messages from the WebSocket
-    /// - `exit_event`: An event listener that notifies the proxy when the
-    ///    kernel has exited
+    /// - `exit_event`: The event that is notified when the kernel has exited;
+    ///    the heartbeat monitor listens for it
     pub fn new(
         connection_file: ConnectionFile,
         connection: KernelConnection,
@@ -118,14 +117,13 @@ impl ZmqWsProxy {
                     "tcp://{}:{}",
                     connection_file.info.ip, connection_file.info.hb_port
                 ),
-                exit_event.clone(),
+                exit_event,
                 disconnected_event.clone(),
             ),
             connection_file,
             connection,
             ws_json_tx,
             ws_zmq_rx,
-            exit_event,
             disconnected_event,
             state,
             session_id: session_id.clone(),
@@ -357,7 +355,17 @@ impl ZmqWsProxy {
         }
     }
 
-    pub async fn listen(&mut self) -> Result<(), anyhow::Error> {
+    /// Forward messages between the kernel and the client until the kernel
+    /// exits or its heartbeat is lost.
+    ///
+    /// `exited` and `disconnected` listen for those two events. The caller
+    /// makes them before it connects this proxy, so that neither event can
+    /// come and go unseen between the connection and here.
+    pub async fn listen(
+        &mut self,
+        mut exited: EventListener,
+        mut disconnected: EventListener,
+    ) -> Result<(), anyhow::Error> {
         let session_id = self.connection.session_id.clone();
         log::debug!(
             "[session {}] Starting ZeroMQ-WebSocket proxy",
@@ -473,11 +481,11 @@ impl ZmqWsProxy {
                         },
                     }
                 },
-                _ = self.exit_event.listen() => {
+                _ = &mut exited => {
                     // The kernel has exited; close the proxy
                     break;
                 },
-                _ = self.disconnected_event.listen() => {
+                _ = &mut disconnected => {
                     // The heartbeat monitor has detected a disconnect; close the proxy
                     break;
                 },

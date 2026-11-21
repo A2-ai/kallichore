@@ -31,6 +31,7 @@ use tokio::sync::RwLock;
 use crate::{
     connection_file::ConnectionFile, execution_history::RECENT_ENTRIES,
     kernel_connection::KernelConnection, kernel_state::KernelState, mcp::McpState,
+    registration_socket::{HandshakeResult, RegistrationSocket},
     startup_status::StartupStatus,
 };
 
@@ -45,6 +46,13 @@ use startup::StartupCoordinator;
 // Re-export utility functions for external use
 pub use execute::{ExecuteError, ExecuteOptions};
 pub use utils::make_message_id;
+
+/// The socket a kernel that performs the JEP 66 handshake registers on, and
+/// the channel the handshake's result arrives on.
+type Registration = (
+    RegistrationSocket,
+    tokio::sync::oneshot::Receiver<HandshakeResult>,
+);
 
 /// How long a start that has failed waits for the process it launched to be
 /// stopped before it reports the failure anyway.
@@ -183,11 +191,13 @@ impl KernelSession {
         // Listen before reading the status, so an exit between the two is seen
         let exited = self.exit_event.listen();
 
+        // Already exited: the process ended by itself, or the start failed
+        // before it launched one
         if self.state.read().await.status == models::Status::Exited {
             return;
         }
 
-        // Nobody is listening if the start failed before it launched a process
+        // Nobody is listening if the start was refused before it began
         if stop_tx.send(()).await.is_err() {
             return;
         }
@@ -238,85 +248,33 @@ impl KernelSession {
         let jep66_enabled =
             ConnectionFile::requires_handshaking(&self.connection.protocol_version.clone());
 
-        // Set up connection or registration file
-        let (connection_file_path, registration_socket, handshake_result_rx) = if jep66_enabled {
-            log::info!(
-                "[session {}] Kernel supports JEP 66 (protocol version {}) - creating registration socket for handshake",
-                self.connection.session_id,
-                self.connection.protocol_version
-            );
-
-            // Set up JEP 66 handshaking
-            let handshake_coord = HandshakeCoordinator::new(
-                self.connection.session_id.clone(),
-                self.connection.clone(),
-                self.ws_json_tx.clone(),
-                None, // shell_used not yet determined
-                None, // startup_command not yet determined
-            );
-
-            let (path, socket, rx) = handshake_coord.setup_registration_socket().await?;
-            (path, Some(socket), Some(rx))
-        } else {
-            // Traditional kernel - generate connection file
-            let connection_file = ConnectionFile::generate(
-                "127.0.0.1".to_string(),
-                self.reserved_ports.clone(),
-                self.connection.key.clone(),
-            )
-            .map_err(|e| StartupError {
-                exit_code: None,
-                output: None,
-                error: crate::error::KSError::ProcessStartFailed(anyhow::anyhow!(
-                    "Failed to generate connection file: {}",
-                    e
-                ))
-                .to_json(None),
-            })?;
-
-            // Store the connection file
-            let conn_mgr = self.connection_manager();
-            conn_mgr
-                .update_connection_file(connection_file.clone())
-                .await;
-
-            // Write to disk
-            let path = coordinator.write_connection_file(&connection_file, "connection")?;
-            (path, None, None)
+        // Launch the kernel's process. When that fails there is no process
+        // whose exit would take the session out of the starting state, so
+        // this does: a session left as starting can not be deleted, and reads
+        // as one whose kernel is on its way.
+        let (child, registration) = match self
+            .launch_process(&mut coordinator, &working_directory, jep66_enabled)
+            .await
+        {
+            Ok(launched) => launched,
+            Err(e) => {
+                let mut state = self.state.write().await;
+                if state.process_id.is_none() {
+                    state
+                        .set_status(
+                            models::Status::Exited,
+                            Some(String::from(
+                                "the start failed before the kernel was launched",
+                            )),
+                        )
+                        .await;
+                }
+                return Err(e);
+            }
         };
-
-        // Substitute connection file path in arguments
-        let argv = coordinator.substitute_connection_file(&self.argv, &connection_file_path);
-
-        log::debug!(
-            "Starting kernel for session {}: {:?}",
-            self.model.session_id,
-            argv
-        );
-
-        // Resolve environment variables
-        let resolved_env = coordinator.resolve_environment().await?;
-
-        // Build the command
-        let mut cmd = coordinator
-            .build_command(&argv, &resolved_env, &working_directory)
-            .await?;
 
         // Create a channel to receive startup status
         let (startup_tx, startup_rx) = async_channel::unbounded::<StartupStatus>();
-
-        // Create the process monitor
-        let process_monitor = ProcessMonitor::new(
-            self.connection.session_id.clone(),
-            self.state.clone(),
-            self.exit_event.clone(),
-            self.ws_json_tx.clone(),
-        );
-
-        // Spawn the kernel process
-        let child = coordinator
-            .spawn_kernel_process(&mut cmd, &resolved_env, &process_monitor)
-            .await?;
 
         // Spawn a task to monitor the child process
         let kernel = self.clone();
@@ -335,14 +293,11 @@ impl KernelSession {
         });
 
         // If JEP 66 is enabled, wait for the handshake
-        if jep66_enabled {
+        if let Some((registration_socket, handshake_result_rx)) = registration {
             log::info!(
                 "[session {}] Waiting for JEP 66 handshake",
                 self.connection.session_id
             );
-
-            let registration_socket = registration_socket.unwrap();
-            let handshake_result_rx = handshake_result_rx.unwrap();
 
             let connection_timeout = self.model.connection_timeout.unwrap_or(30) as u64;
 
@@ -407,7 +362,7 @@ impl KernelSession {
         tokio::spawn(async move {
             let connection = kernel.connection.clone();
             kernel
-                .start_zmq_proxy(connection_file.clone(), connection, startup_proxy_tx)
+                .start_zmq_proxy(connection_file.clone(), connection, startup_proxy_tx, None)
                 .await;
         });
 
@@ -425,6 +380,98 @@ impl KernelSession {
         coordinator.handle_kernel_info(&result).await;
 
         Ok(result)
+    }
+
+    /// Everything a start does up to and including the launch of the
+    /// kernel's process: the connection or registration file, the
+    /// environment, the command.
+    ///
+    /// Returns the process and, for a kernel that performs the JEP 66
+    /// handshake, the socket it will register on.
+    async fn launch_process(
+        &self,
+        coordinator: &mut StartupCoordinator,
+        working_directory: &str,
+        jep66_enabled: bool,
+    ) -> Result<(tokio::process::Child, Option<Registration>), StartupError> {
+        // Set up connection or registration file
+        let (connection_file_path, registration) = if jep66_enabled {
+            log::info!(
+                "[session {}] Kernel supports JEP 66 (protocol version {}) - creating registration socket for handshake",
+                self.connection.session_id,
+                self.connection.protocol_version
+            );
+
+            // Set up JEP 66 handshaking
+            let handshake_coord = HandshakeCoordinator::new(
+                self.connection.session_id.clone(),
+                self.connection.clone(),
+                self.ws_json_tx.clone(),
+                None, // shell_used not yet determined
+                None, // startup_command not yet determined
+            );
+
+            let (path, socket, rx) = handshake_coord.setup_registration_socket().await?;
+            (path, Some((socket, rx)))
+        } else {
+            // Traditional kernel - generate connection file
+            let connection_file = ConnectionFile::generate(
+                "127.0.0.1".to_string(),
+                self.reserved_ports.clone(),
+                self.connection.key.clone(),
+            )
+            .map_err(|e| StartupError {
+                exit_code: None,
+                output: None,
+                error: crate::error::KSError::ProcessStartFailed(anyhow::anyhow!(
+                    "Failed to generate connection file: {}",
+                    e
+                ))
+                .to_json(None),
+            })?;
+
+            // Store the connection file
+            let conn_mgr = self.connection_manager();
+            conn_mgr
+                .update_connection_file(connection_file.clone())
+                .await;
+
+            // Write to disk
+            let path = coordinator.write_connection_file(&connection_file, "connection")?;
+            (path, None)
+        };
+
+        // Substitute connection file path in arguments
+        let argv = coordinator.substitute_connection_file(&self.argv, &connection_file_path);
+
+        log::debug!(
+            "Starting kernel for session {}: {:?}",
+            self.model.session_id,
+            argv
+        );
+
+        // Resolve environment variables
+        let resolved_env = coordinator.resolve_environment().await?;
+
+        // Build the command
+        let mut cmd = coordinator
+            .build_command(&argv, &resolved_env, working_directory)
+            .await?;
+
+        // Create the process monitor
+        let process_monitor = ProcessMonitor::new(
+            self.connection.session_id.clone(),
+            self.state.clone(),
+            self.exit_event.clone(),
+            self.ws_json_tx.clone(),
+        );
+
+        // Spawn the kernel process
+        let child = coordinator
+            .spawn_kernel_process(&mut cmd, &resolved_env, &process_monitor)
+            .await?;
+
+        Ok((child, registration))
     }
 
     /// Shutdown the kernel.
@@ -510,6 +557,13 @@ impl KernelSession {
         // Create a channel to receive startup status
         let (startup_tx, startup_rx) = async_channel::unbounded::<StartupStatus>();
 
+        // Held for as long as this call waits for the adoption. A kernel that
+        // is busy gives its first answer only when it is done, which can be
+        // long after the caller has stopped waiting; when this call is
+        // dropped so is the sender, and the proxy that is still waiting for
+        // that answer gives the adoption up (see `start_zmq_proxy`).
+        let (waiting_tx, waiting_rx) = tokio::sync::oneshot::channel::<()>();
+
         // Start the ZeroMQ proxy
         let kernel = self.clone();
         tokio::spawn(async move {
@@ -519,7 +573,7 @@ impl KernelSession {
             );
 
             kernel
-                .start_zmq_proxy(connection_file, connection, startup_tx)
+                .start_zmq_proxy(connection_file, connection, startup_tx, Some(waiting_rx))
                 .await;
 
             log::debug!(
@@ -551,6 +605,7 @@ impl KernelSession {
 
         // Wait for the proxy to connect
         let startup_result = startup_rx.recv().await;
+        drop(waiting_tx);
         match startup_result {
             Ok(StartupStatus::Connected(kernel_info)) => {
                 log::trace!(
@@ -666,13 +721,23 @@ impl KernelSession {
     /// lifetime. It's usually `self.connection`, but adopted kernels (see
     /// `connect`) sign with a key that isn't known until the adopting client
     /// supplies it, so callers pass a corrected connection in that case.
+    ///
+    /// `adoption_waiter` is given for a kernel that is being adopted, and is
+    /// `None` for one this session launched. It resolves when nobody waits
+    /// for the adoption any more; a proxy that has not had the kernel's first
+    /// answer by then ends, and closes its sockets, without anything being
+    /// sent to the kernel. A proxy left waiting would go on to forward
+    /// messages for an adoption its caller has written off.
     async fn start_zmq_proxy(
         &self,
         connection_file: ConnectionFile,
         connection: KernelConnection,
         status_tx: Sender<StartupStatus>,
+        adoption_waiter: Option<tokio::sync::oneshot::Receiver<()>>,
     ) {
         use crate::{error::KSError, zmq_ws_proxy::ZmqWsProxy};
+
+        let launched = adoption_waiter.is_none();
 
         let mut proxy = ZmqWsProxy::new(
             connection_file.clone(),
@@ -683,6 +748,30 @@ impl KernelSession {
             self.exit_event.clone(),
         );
 
+        // Listen for the kernel's exit, and for the loss of its heartbeat,
+        // from before anything is connected, and keep these same listeners
+        // until the proxy ends. A listener made later, or made anew for each
+        // wait, is not there in between and misses an event that comes then.
+        let mut exited = self.exit_event.listen();
+        let mut disconnected = proxy.disconnected_event.listen();
+
+        // The kernel this start launched may have exited before the listener
+        // above was there. (Not asked of an adoption: the session a kernel is
+        // adopted into has no process of its own to have exited.)
+        if launched && self.state.read().await.status == models::Status::Exited {
+            return;
+        }
+
+        let abandoned = async {
+            match adoption_waiter {
+                Some(waiter) => {
+                    let _ = waiter.await;
+                }
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::pin!(abandoned);
+
         // Wait for either the proxy to connect or for the session to exit
         let connect_or_exit = async {
             tokio::select! {
@@ -692,7 +781,7 @@ impl KernelSession {
                         Err(e) => Err(KSError::SessionConnectionFailed(e)),
                     }
                 },
-                _ = self.exit_event.listen() => {
+                _ = &mut exited => {
                     Err(KSError::ExitedBeforeConnection)
                 }
             }
@@ -700,17 +789,54 @@ impl KernelSession {
 
         let connection_timeout = self.model.connection_timeout.unwrap_or(30) as u64;
 
-        match tokio::time::timeout(
-            std::time::Duration::new(connection_timeout, 0),
-            connect_or_exit,
-        )
-        .await
-        {
+        let connected = tokio::select! {
+            connected = tokio::time::timeout(
+                std::time::Duration::new(connection_timeout, 0),
+                connect_or_exit,
+            ) => connected,
+            _ = &mut abandoned => {
+                log::info!(
+                    "[session {}] Nobody is waiting for this adoption any more; giving it up",
+                    self.connection.session_id
+                );
+                return;
+            }
+        };
+
+        match connected {
             Ok(Ok(())) => {
-                // Get kernel info
-                match proxy.get_kernel_info().await {
+                // Get kernel info. The wait for it has no time limit, so it
+                // has to end when there is nothing left to wait for: the
+                // kernel has exited (the task that watches its process tells
+                // the start), its heartbeat is lost, or the adoption has been
+                // abandoned.
+                let kernel_info = tokio::select! {
+                    info = proxy.get_kernel_info() => info,
+                    _ = &mut exited => {
+                        log::debug!(
+                            "[session {}] The kernel exited before its first answer; ending its proxy",
+                            self.connection.session_id
+                        );
+                        return;
+                    }
+                    _ = &mut disconnected => Err(anyhow::anyhow!(
+                        "The kernel's heartbeat was lost before the kernel gave its first answer"
+                    )),
+                    _ = &mut abandoned => {
+                        log::info!(
+                            "[session {}] Nobody is waiting for this adoption any more; giving it up",
+                            self.connection.session_id
+                        );
+                        return;
+                    }
+                };
+                match kernel_info {
                     Ok(info) => {
-                        let _ = status_tx.send(StartupStatus::Connected(info)).await;
+                        let taken = status_tx.send(StartupStatus::Connected(info)).await;
+                        if taken.is_err() && !launched {
+                            // The caller went away as the answer came
+                            return;
+                        }
                     }
                     Err(e) => {
                         let error = KSError::SessionConnectionFailed(e);
@@ -745,7 +871,7 @@ impl KernelSession {
         }
 
         // Listen for messages
-        match proxy.listen().await {
+        match proxy.listen(exited, disconnected).await {
             Ok(_) => (),
             Err(e) => {
                 let error = KSError::ZmqProxyError(e);
