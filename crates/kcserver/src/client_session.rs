@@ -31,7 +31,8 @@ use crate::kernel_state::KernelState;
 use tokio_util::sync::CancellationToken;
 
 /// How long a client that another is taking the place of is given to take
-/// the message that says so. Its connection is closed after that either way.
+/// the message that says so and to close its side of the connection. The
+/// connection is closed after that either way.
 const FAREWELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
@@ -185,7 +186,19 @@ impl ClientSession {
                 if let Ok(close_msg) = serde_json::to_string(&close_msg) {
                     ws_stream.send(Message::Text(close_msg)).await?;
                 }
-                ws_stream.send(Message::Close(None)).await
+                ws_stream.send(Message::Close(None)).await?;
+
+                // Wait for the client to close its side before the
+                // connection is dropped. A client that had fallen behind is
+                // still reading what was sent to it earlier; a connection
+                // closed under it then is reset by whatever it sends next,
+                // and it may see neither this message nor the end.
+                while let Some(Ok(message)) = ws_stream.next().await {
+                    if message.is_close() {
+                        break;
+                    }
+                }
+                Ok::<(), tokio_tungstenite::tungstenite::Error>(())
             };
             match tokio::time::timeout(FAREWELL_TIMEOUT, farewell).await {
                 Ok(Ok(())) => {}
