@@ -7,6 +7,7 @@
 //
 
 use std::collections::HashMap;
+use std::sync::{Arc, Weak};
 
 use async_channel::Sender;
 use kallichore_api::models;
@@ -39,9 +40,12 @@ pub struct KernelState {
     /// Whether the kernel is connected to a client.
     pub connected: bool,
 
-    /// Whether the kernel is currently restarting. This flag triggers an automatic
-    /// startup after the kernel exits for restart.
-    pub restarting: bool,
+    /// The restart of the kernel that is in progress, if one is: the kernel
+    /// has been asked to shut down and is started again when it has exited.
+    /// It is over when its `RestartClaim` is dropped, which is also what
+    /// happens to a restart whose client stops waiting for the kernel to
+    /// exit.
+    restart: Weak<()>,
 
     /// The current working directory of the kernel.
     pub working_directory: String,
@@ -114,7 +118,28 @@ pub struct KernelState {
     status_before_offline: Option<models::Status>,
 }
 
+/// A restart of a kernel that is in progress. The session counts as
+/// restarting until this is dropped.
+#[derive(Debug)]
+pub struct RestartClaim(#[allow(dead_code)] Arc<()>);
+
 impl KernelState {
+    /// Whether a restart of the kernel is in progress.
+    pub fn restarting(&self) -> bool {
+        self.restart.strong_count() > 0
+    }
+
+    /// Begins a restart of the kernel, which lasts until the claim that is
+    /// returned is dropped. Returns `None` if a restart is in progress.
+    pub fn begin_restart(&mut self) -> Option<RestartClaim> {
+        if self.restarting() {
+            return None;
+        }
+        let claim = Arc::new(());
+        self.restart = Arc::downgrade(&claim);
+        Some(RestartClaim(claim))
+    }
+
     /// Create a new kernel state.
     pub fn new(
         session: models::NewSession,
@@ -127,7 +152,7 @@ impl KernelState {
             status: models::Status::Idle,
             working_directory,
             connected: false,
-            restarting: false,
+            restart: Weak::new(),
             process_id: None,
             execution_queue: ExecutionQueue::new(),
             history: ExecutionHistory::default(),
@@ -407,6 +432,25 @@ mod tests {
         let mut state = KernelState::new(session, String::new(), idle_nudge_tx, ws_json_tx);
         state.set_status(status, None).await;
         (state, idle_nudge_rx, ws_json_rx)
+    }
+
+    #[tokio::test]
+    async fn a_restart_is_in_progress_until_its_claim_is_dropped() {
+        let (mut state, _nudges, _messages) = state_in(Status::Idle).await;
+        assert!(!state.restarting());
+
+        let claim = state.begin_restart();
+        assert!(claim.is_some());
+        assert!(state.restarting());
+        assert!(
+            state.begin_restart().is_none(),
+            "a second restart cannot begin while the first is in progress"
+        );
+
+        // The restart ends, or its client stops waiting for it
+        drop(claim);
+        assert!(!state.restarting());
+        assert!(state.begin_restart().is_some());
     }
 
     #[tokio::test]

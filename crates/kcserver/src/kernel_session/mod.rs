@@ -502,29 +502,54 @@ impl KernelSession {
         env: Option<Vec<models::VarAction>>,
     ) -> Result<(), StartupError> {
         let lifecycle = self.lifecycle_manager();
-        lifecycle.restart(working_directory, env).await?;
 
-        // Wait for the kernel to exit
-        if !lifecycle.wait_for_exit_and_signal().await {
-            return Ok(());
-        }
+        // Listen for the kernel's exit before anything is asked of it: an
+        // exit that came before the listener was there would not be heard,
+        // and the restart would wait for good.
+        let exited = self.exit_event.listen();
+        let claim = lifecycle.restart(working_directory, env).await?;
 
-        // Restart the kernel
-        match self.start().await {
-            Ok(_) => {
+        // Wait for the kernel to exit. This wait belongs to the request: if
+        // the client stops waiting, the restart is over with it (the claim
+        // is dropped), and the kernel, which has been asked to shut down, is
+        // not started again behind the client's back whenever it does exit.
+        exited.await;
+
+        // Start the kernel again, in a task of its own: a start is not left
+        // half done if the client stops waiting now. The session counts as
+        // restarting until the start is over.
+        let session = self.clone();
+        let start = tokio::spawn(async move {
+            let _claim = claim;
+            session.start().await
+        });
+        match start.await {
+            Ok(Ok(_)) => {
                 log::debug!(
                     "[session {}] Kernel restarted successfully",
                     self.connection.session_id
                 );
                 Ok(())
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 log::error!(
                     "[session {}] Failed to restart kernel: {}",
                     self.connection.session_id,
                     e.error.message
                 );
                 Err(e)
+            }
+            Err(e) => {
+                let err = crate::error::KSError::RestartFailed(anyhow::anyhow!(
+                    "The start of the kernel did not run to its end: {}",
+                    e
+                ));
+                err.log();
+                Err(StartupError {
+                    exit_code: None,
+                    output: None,
+                    error: err.to_json(None),
+                })
             }
         }
     }
@@ -731,7 +756,6 @@ impl KernelSession {
             self.connection.session_id.clone(),
             self.state.clone(),
             self.ws_zmq_tx.clone(),
-            self.exit_event.clone(),
             self.model.working_directory.clone(),
         )
     }
