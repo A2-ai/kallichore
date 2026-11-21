@@ -30,7 +30,7 @@ serde_json = "1.0.125"
 anyhow = "1.0.86"
 rand = "0.8.5"
 hex = "0.4.3"
-zeromq = "0.4.1"
+zeromq = "0.7.0"
 tokio-tungstenite = "0.23.1"
 hyper-util = { version = "0.1.12", features = ["tokio", "server", "server-auto"] }
 kcshared = { path = "../kcshared" }
