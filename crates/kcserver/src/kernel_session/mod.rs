@@ -46,6 +46,10 @@ use startup::StartupCoordinator;
 pub use execute::{ExecuteError, ExecuteOptions};
 pub use utils::make_message_id;
 
+/// How long a start that has failed waits for the process it launched to be
+/// stopped before it reports the failure anyway.
+const FAILED_START_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// A Jupyter kernel session.
 ///
 /// This object represents an instance of Jupyter kernel. It consists of only
@@ -157,6 +161,51 @@ impl KernelSession {
     ///
     /// The kernel info, as a JSON object.
     pub async fn start(&self) -> Result<serde_json::Value, StartupError> {
+        // The task that watches the kernel's process holds the receiving end,
+        // so that a start that fails can have the process it launched stopped.
+        let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
+
+        let result = self.launch(stop_rx).await;
+        if result.is_err() {
+            self.stop_failed_start(stop_tx).await;
+        }
+        result
+    }
+
+    /// Stop the process of a kernel whose start has failed, and wait for the
+    /// session to be marked as exited.
+    ///
+    /// A start can fail while the process it launched is still running: the
+    /// kernel did not connect, or did not complete its handshake, in time.
+    /// Nothing is connected to that process, so it is stopped before the
+    /// failure is reported, and the session is left as one that has exited.
+    async fn stop_failed_start(&self, stop_tx: Sender<()>) {
+        // Listen before reading the status, so an exit between the two is seen
+        let exited = self.exit_event.listen();
+
+        if self.state.read().await.status == models::Status::Exited {
+            return;
+        }
+
+        // Nobody is listening if the start failed before it launched a process
+        if stop_tx.send(()).await.is_err() {
+            return;
+        }
+
+        if tokio::time::timeout(FAILED_START_STOP_TIMEOUT, exited)
+            .await
+            .is_err()
+        {
+            log::warn!(
+                "[session {}] The kernel's process was still running {} seconds after its failed start asked for it to be stopped",
+                self.connection.session_id,
+                FAILED_START_STOP_TIMEOUT.as_secs()
+            );
+        }
+    }
+
+    /// Launch the kernel's process and connect to it.
+    async fn launch(&self, stop_rx: Receiver<()>) -> Result<serde_json::Value, StartupError> {
         // Create the startup coordinator
         let mut coordinator = StartupCoordinator {
             session_id: self.connection.session_id.clone(),
@@ -281,7 +330,7 @@ impl KernelSession {
             );
             let consume_output = || kernel.consume_output_streams();
             monitor
-                .run_child(child, startup_child_tx, consume_output)
+                .run_child(child, startup_child_tx, stop_rx, consume_output)
                 .await;
         });
 

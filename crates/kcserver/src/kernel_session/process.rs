@@ -8,7 +8,7 @@
 
 //! Child process management for kernel sessions.
 
-use async_channel::Sender;
+use async_channel::{Receiver, Sender};
 use event_listener::Event;
 use kallichore_api::models;
 use kcshared::{
@@ -69,16 +69,41 @@ impl ProcessMonitor {
     ///
     /// This method blocks until the child process exits, then updates the kernel
     /// state and notifies listeners.
+    ///
+    /// A message on `stop_rx` stops the process. The start that launched the
+    /// process sends one when it fails while the process is still running.
     pub async fn run_child<F>(
         &self,
         mut child: tokio::process::Child,
         startup_tx: Sender<StartupStatus>,
+        stop_rx: Receiver<()>,
         consume_output: F,
     ) where
         F: Fn() -> String,
     {
         // Actually run the kernel! This will block until the kernel exits.
-        let status = child.wait().await.expect("Failed to wait on child process");
+        //
+        // Once the start has succeeded its end of the stop channel is dropped;
+        // the second branch is then disabled and this waits on the process
+        // alone.
+        let status = tokio::select! {
+            status = child.wait() => status,
+            Ok(()) = stop_rx.recv() => {
+                log::info!(
+                    "Stopping the child process for session {}; its start failed",
+                    self.session_id
+                );
+                if let Err(e) = child.start_kill() {
+                    log::warn!(
+                        "Failed to stop the child process for session {}: {}",
+                        self.session_id,
+                        e
+                    );
+                }
+                child.wait().await
+            }
+        }
+        .expect("Failed to wait on child process");
         let code = status.code().unwrap_or(-1);
 
         log::info!(
@@ -90,21 +115,21 @@ impl ProcessMonitor {
         // The kernel's accounting job has nothing left in it now.
         super::job_object::release_session_job(&self.session_id);
 
-        // Check the kernel state. If we were still in the Starting state when
-        // the process exited, that's bad.
-        {
-            let state = self.state.read().await;
-            if state.status == models::Status::Starting {
-                let output = consume_output();
-                startup_tx
-                    .send(StartupStatus::AbnormalExit(
-                        code,
-                        output,
-                        KSError::ProcessAbnormalExit(status),
-                    ))
-                    .await
-                    .expect("Failed to send startup status");
-            }
+        // If the start that launched this process is still waiting for the
+        // kernel, that's bad; tell it the process has exited. This goes by
+        // the channel rather than by the session's status: the status can
+        // have moved on from Starting while the start still waits (a kernel
+        // with no heartbeat is marked offline), and it can still be Starting
+        // after the start has failed and stopped waiting.
+        if !startup_tx.is_closed() {
+            let output = consume_output();
+            let _ = startup_tx
+                .send(StartupStatus::AbnormalExit(
+                    code,
+                    output,
+                    KSError::ProcessAbnormalExit(status),
+                ))
+                .await;
         }
 
         // We are now exited; mark the kernel as such
