@@ -661,7 +661,7 @@ impl ZmqWsProxy {
         match jupyter {
             JupyterMsg::Status(status) => {
                 // Write the new status to the kernel state
-                let state = {
+                let ends_execution = {
                     let mut state = self.state.write().await;
                     // Deliver the status update with the parent message type's
                     // name if known
@@ -669,19 +669,40 @@ impl ZmqWsProxy {
                         Some(ref parent) => Some(parent.msg_type.clone()),
                         None => None,
                     };
+                    // While an execution is active, the kernel is busy with it:
+                    // a request handled beside it (one on the control channel,
+                    // which a kernel answers while it executes code) reports a
+                    // busy and an idle of its own, and that idle neither makes
+                    // the session idle nor ends the execution. Only the idle
+                    // whose parent is the active execution does.
+                    let ends_execution = match (
+                        state.execution_queue.active.as_ref(),
+                        message.parent_header.as_ref(),
+                    ) {
+                        (None, _) => true,
+                        (Some(active), Some(parent)) => active.header.msg_id == parent.msg_id,
+                        (Some(_), None) => false,
+                    };
                     match status.execution_state {
                         ExecutionState::Busy => {
                             state.set_status(models::Status::Busy, reason).await;
                         }
-                        ExecutionState::Idle => {
+                        ExecutionState::Idle if ends_execution => {
                             state.set_status(models::Status::Idle, reason).await;
                         }
+                        ExecutionState::Idle => {
+                            log::debug!(
+                                "[session {}] Idle for {} while an execution is active; the session stays busy",
+                                self.session_id,
+                                reason.as_deref().unwrap_or("a message with no parent"),
+                            );
+                        }
                     };
-                    status.execution_state
+                    matches!(status.execution_state, ExecutionState::Idle) && ends_execution
                 };
-                // If the kernel is now idle, process the next message in the queue
-                match state {
-                    ExecutionState::Idle => {
+                // If the execution is over, process the next message in the queue
+                match ends_execution {
+                    true => {
                         let mut state = self.state.write().await;
                         match state.execution_queue.next_request() {
                             Some(request) => {
@@ -702,7 +723,7 @@ impl ZmqWsProxy {
                             }
                         }
                     }
-                    _ => {}
+                    false => {}
                 }
             }
             _ => {
