@@ -1730,10 +1730,25 @@ where
         };
 
         // Attempt to start the kernel; blocks until the kernel sockets are
-        // connected or a failure occurs
-        match kernel_session.start().await {
-            Ok(kernel_info) => Ok(StartSessionResponse::Started(kernel_info)),
-            Err(e) => Ok(StartSessionResponse::StartFailed(e)),
+        // connected or a failure occurs.
+        //
+        // The start runs in a task of its own. This request can be dropped
+        // part-way (its client went away), and a start that has been accepted
+        // has to be carried through either to a session that is set up or to
+        // the cleanup of one that failed.
+        let start = tokio::spawn(async move { kernel_session.start().await });
+        match start.await {
+            Ok(Ok(kernel_info)) => Ok(StartSessionResponse::Started(kernel_info)),
+            Ok(Err(e)) => Ok(StartSessionResponse::StartFailed(e)),
+            Err(e) => {
+                let err = KSError::StartFailed(anyhow!("The start did not run to its end: {}", e));
+                err.log();
+                Ok(StartSessionResponse::StartFailed(models::StartupError {
+                    exit_code: None,
+                    output: None,
+                    error: err.to_json(None),
+                }))
+            }
         }
     }
 
