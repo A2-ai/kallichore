@@ -112,29 +112,34 @@ impl WireMessage {
         };
         let parts = parts.drain(pos + 1..).collect::<Vec<_>>();
 
-        // Validate HMAC signature if a key is provided
+        // After the delimiter come the signature, the header, the parent
+        // header, the metadata and the content; buffers may follow
+        if parts.len() < 5 {
+            return Err(anyhow::anyhow!(
+                "Message has {} parts after the delimiter; a message has at least 5",
+                parts.len()
+            ));
+        }
+
+        // Validate HMAC signature if a key is provided. A connection with a
+        // key takes no unsigned message: an empty signature is what a sender
+        // without the key would send.
         if let Some(key) = hmac_key {
-            if parts.is_empty() {
-                return Err(anyhow::anyhow!("Message has no signature part"));
-            }
-
-            // The signature is in parts[0], and it should be validated against parts[1-4]
             let signature_bytes = &parts[0];
-            if !signature_bytes.is_empty() {
-                let signature_str = std::str::from_utf8(signature_bytes)
-                    .map_err(|_| anyhow::anyhow!("Invalid signature encoding"))?;
-
-                // Compute expected signature over parts 1-4 (header, parent_header, metadata, content)
-                let mut expected_mac = key.clone();
-                for part in parts.iter().skip(1).take(4) {
-                    expected_mac.update(part);
-                }
-                let expected_signature = hex::encode(expected_mac.finalize().into_bytes());
-
-                if signature_str != expected_signature {
-                    return Err(anyhow::anyhow!("HMAC signature validation failed"));
-                }
+            if signature_bytes.is_empty() {
+                return Err(anyhow::anyhow!("Message is not signed"));
             }
+            let signature = hex::decode(signature_bytes)
+                .map_err(|_| anyhow::anyhow!("Invalid signature encoding"))?;
+
+            // The signature is over parts 1-4 (header, parent_header, metadata, content)
+            let mut expected_mac = key.clone();
+            for part in parts.iter().skip(1).take(4) {
+                expected_mac.update(part);
+            }
+            expected_mac
+                .verify_slice(&signature)
+                .map_err(|_| anyhow::anyhow!("HMAC signature validation failed"))?;
         }
         let header: WireMessageHeader = serde_json::from_value(Self::parse_buffer(&parts[1])?)?;
         let jupyter_header: JupyterMessageHeader = header.into();
@@ -193,5 +198,108 @@ impl Into<ZmqMessage> for WireMessage {
             zmq_message.push_back(Bytes::from(part));
         }
         zmq_message
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmac::Hmac;
+
+    fn connection(key: &str) -> KernelConnection {
+        let (key, hmac_key) = if key.is_empty() {
+            (None, None)
+        } else {
+            (
+                Some(key.to_string()),
+                Some(Hmac::<Sha256>::new_from_slice(key.as_bytes()).unwrap()),
+            )
+        };
+        KernelConnection {
+            session_id: "test-session".to_string(),
+            username: "test-user".to_string(),
+            key,
+            protocol_version: "5.3".to_string(),
+            hmac_key,
+        }
+    }
+
+    /// A message as it arrives from a socket: the delimiter, then the parts
+    /// `from_jupyter` produces for a message sent on `sender`'s connection.
+    fn received(sender: &KernelConnection) -> WireMessage {
+        let message = JupyterMessage {
+            header: JupyterMessageHeader {
+                msg_id: "an-id".to_string(),
+                msg_type: "status".to_string(),
+            },
+            parent_header: None,
+            channel: JupyterChannel::IOPub,
+            content: serde_json::json!({"execution_state": "idle"}),
+            metadata: serde_json::json!({}),
+            buffers: vec![],
+        };
+        let mut wire = WireMessage::from_jupyter(message, sender.clone()).unwrap();
+        wire.parts.insert(0, MSG_DELIM.to_vec());
+        wire
+    }
+
+    fn read(
+        message: &WireMessage,
+        receiver: &KernelConnection,
+    ) -> Result<JupyterMessage, anyhow::Error> {
+        message.to_jupyter(JupyterChannel::IOPub, receiver.hmac_key.clone())
+    }
+
+    #[test]
+    fn a_message_signed_with_the_key_is_read() {
+        let message = received(&connection("the-key"));
+        let read = read(&message, &connection("the-key")).unwrap();
+        assert_eq!(read.header.msg_type, "status");
+    }
+
+    #[test]
+    fn a_message_signed_with_another_key_is_refused() {
+        let message = received(&connection("another-key"));
+        let error = read(&message, &connection("the-key")).unwrap_err();
+        assert_eq!(error.to_string(), "HMAC signature validation failed");
+    }
+
+    #[test]
+    fn an_unsigned_message_is_refused_on_a_connection_with_a_key() {
+        let message = received(&connection(""));
+        assert!(
+            message.parts[1].is_empty(),
+            "the message has an empty signature"
+        );
+        let error = read(&message, &connection("the-key")).unwrap_err();
+        assert_eq!(error.to_string(), "Message is not signed");
+    }
+
+    #[test]
+    fn an_unsigned_message_is_read_on_a_connection_without_a_key() {
+        let message = received(&connection(""));
+        assert!(read(&message, &connection("")).is_ok());
+    }
+
+    #[test]
+    fn a_signature_that_is_not_hexadecimal_is_refused() {
+        let mut message = received(&connection("the-key"));
+        message.parts[1] = b"not hexadecimal".to_vec();
+        let error = read(&message, &connection("the-key")).unwrap_err();
+        assert_eq!(error.to_string(), "Invalid signature encoding");
+    }
+
+    #[test]
+    fn a_message_with_too_few_parts_is_refused() {
+        for receiver in [connection("the-key"), connection("")] {
+            let mut message = received(&receiver);
+            message.parts.truncate(4);
+            let error = read(&message, &receiver).unwrap_err();
+            assert!(
+                error.to_string().starts_with("Message has 3 parts"),
+                "{}",
+                error
+            );
+        }
     }
 }

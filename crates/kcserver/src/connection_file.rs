@@ -42,8 +42,10 @@ impl ConnectionFile {
         Ok(control)
     }
 
+    /// Write the connection file to disk, readable only by the user the
+    /// server runs as: it holds the kernel's signing key.
     pub fn to_file<P: AsRef<Path>>(&self, connection_file: P) -> Result<(), Box<dyn Error>> {
-        let file = File::create(connection_file)?;
+        let file = crate::private_file::create(connection_file)?;
         serde_json::to_writer_pretty(file, &self.info)?;
         Ok(())
     }

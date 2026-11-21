@@ -229,9 +229,7 @@ impl KernelState {
     pub fn first_answer_while_offline(&mut self) {
         if matches!(
             self.status_before_offline,
-            Some(
-                models::Status::Uninitialized | models::Status::Starting | models::Status::Ready
-            )
+            Some(models::Status::Uninitialized | models::Status::Starting | models::Status::Ready)
         ) {
             self.status_before_offline = Some(models::Status::Idle);
         }

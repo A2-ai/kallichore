@@ -16,13 +16,9 @@ use kcshared::{
 };
 
 use crate::{
-    connection_file::ConnectionFile,
-    error::KSError,
-    kernel_connection::KernelConnection,
-    kernel_session::utils::strip_startup_markers,
-    registration_file::RegistrationFile,
-    registration_socket::RegistrationSocket,
-    startup_status::StartupStatus,
+    connection_file::ConnectionFile, error::KSError, kernel_connection::KernelConnection,
+    kernel_session::utils::strip_startup_markers, registration_file::RegistrationFile,
+    registration_socket::RegistrationSocket, startup_status::StartupStatus,
 };
 
 /// Coordinates JEP 66 handshaking between kernel and server.

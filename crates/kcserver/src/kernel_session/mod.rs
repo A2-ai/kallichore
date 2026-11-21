@@ -31,8 +31,7 @@ use tokio::sync::RwLock;
 use crate::{
     connection_file::ConnectionFile, execution_history::RECENT_ENTRIES,
     kernel_connection::KernelConnection, kernel_state::KernelState, mcp::McpState,
-    registration_socket::RegistrationSocket,
-    startup_status::StartupStatus,
+    registration_socket::RegistrationSocket, startup_status::StartupStatus,
 };
 
 use connection::ConnectionManager;
