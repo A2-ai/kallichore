@@ -86,6 +86,12 @@ pub struct KernelState {
     /// The connection file for the kernel, or None if not set.
     pub connection_file: Option<ConnectionFile>,
 
+    /// The files the current launch wrote for its kernel to read as it
+    /// starts (its connection file, or its registration file for a JEP 66
+    /// handshake). They hold the session's key, and nothing reads them once
+    /// the kernel's process has exited: they are removed then.
+    pub launch_files: Vec<std::path::PathBuf>,
+
     /// The reservation of the ports in a connection file that was generated
     /// before the kernel was started, because a client asked for the
     /// connection information early. The ports are released when that
@@ -166,6 +172,7 @@ impl KernelState {
             idle_since: Some(std::time::Instant::now()),
             busy_since: None,
             connection_file: None,
+            launch_files: Vec::new(),
             connection_file_ports: None,
             client_socket_path: None,
             connected_client: None,
@@ -280,6 +287,29 @@ impl KernelState {
             Some(String::from("heartbeat detected after offline")),
         )
         .await;
+    }
+
+    /// Removes the files the current launch wrote for its kernel (see
+    /// `launch_files`). Called once the kernel's process has exited. A file
+    /// that is already gone is not an error; one that cannot be removed is
+    /// logged and forgotten.
+    pub fn remove_launch_files(&mut self) {
+        for path in self.launch_files.drain(..) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => log::debug!(
+                    "[session {}] Removed {} (its kernel has exited)",
+                    self.session_id,
+                    path.display()
+                ),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => log::warn!(
+                    "[session {}] Could not remove {} after its kernel exited: {}",
+                    self.session_id,
+                    path.display(),
+                    e
+                ),
+            }
+        }
     }
 
     /// The kernel has given its first answer: the reply to the

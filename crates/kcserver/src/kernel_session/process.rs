@@ -141,6 +141,9 @@ impl ProcessMonitor {
                     Some(String::from("child process exited")),
                 )
                 .await;
+            // Before anyone hears of the exit: a restart waiting for it then
+            // writes its own files, which this must not remove
+            state.remove_launch_files();
         }
 
         // Notify anyone listening that the kernel has exited

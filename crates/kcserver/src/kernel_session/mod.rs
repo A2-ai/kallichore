@@ -288,6 +288,8 @@ impl KernelSession {
                             )),
                         )
                         .await;
+                    // No process will read what was written for it
+                    state.remove_launch_files();
                 }
                 return Err(e);
             }
@@ -479,6 +481,13 @@ impl KernelSession {
             let path = coordinator.write_connection_file(&connection_file, "connection")?;
             (path, None, Some(port_reservation))
         };
+
+        // Remembered, so that the file is removed once the kernel has exited
+        self.state
+            .write()
+            .await
+            .launch_files
+            .push(connection_file_path.clone());
 
         // Substitute connection file path in arguments
         let argv = coordinator.substitute_connection_file(&self.argv, &connection_file_path);
