@@ -165,6 +165,27 @@ impl KernelSession {
     ///
     /// The kernel info, as a JSON object.
     pub async fn start(&self) -> Result<serde_json::Value, StartupError> {
+        self.start_once(false).await
+    }
+
+    /// Start the kernel, once: the session is claimed first (`claim_start`),
+    /// and a start that is refused there has launched nothing and stops
+    /// nothing; the kernel that is running, or on its way, is left alone.
+    async fn start_once(&self, for_restart: bool) -> Result<serde_json::Value, StartupError> {
+        let claim = {
+            let mut state = self.state.write().await;
+            state.claim_start("start API called", for_restart).await
+        };
+        if let Err(reason) = claim {
+            let err = crate::error::KSError::StartFailed(anyhow::anyhow!("{}", reason));
+            err.log();
+            return Err(StartupError {
+                exit_code: None,
+                output: None,
+                error: err.to_json(None),
+            });
+        }
+
         // The task that watches the kernel's process holds the receiving end,
         // so that a start that fails can have the process it launched stopped.
         let (stop_tx, stop_rx) = async_channel::bounded::<()>(1);
@@ -225,20 +246,23 @@ impl KernelSession {
             startup_command: None,
         };
 
-        // Validate that the session can be started
-        coordinator.validate_startup()?;
-
-        // Mark the kernel as starting
-        let working_directory = {
+        // Validate that the session can be started. The session is claimed
+        // (`Starting`) and has no process: one that cannot be started is
+        // left as one that has exited, which can be started again or deleted.
+        if let Err(e) = coordinator.validate_startup() {
             let mut state = self.state.write().await;
             state
                 .set_status(
-                    models::Status::Starting,
-                    Some(String::from("start API called")),
+                    models::Status::Exited,
+                    Some(String::from(
+                        "the start failed before the kernel was launched",
+                    )),
                 )
                 .await;
-            state.working_directory.clone()
-        };
+            return Err(e);
+        }
+
+        let working_directory = self.state.read().await.working_directory.clone();
 
         // Check if we expect JEP 66 handshaking based on protocol version
         let jep66_enabled =
@@ -521,7 +545,7 @@ impl KernelSession {
         let session = self.clone();
         let start = tokio::spawn(async move {
             let _claim = claim;
-            session.start().await
+            session.start_once(true).await
         });
         match start.await {
             Ok(Ok(_)) => {
@@ -575,6 +599,18 @@ impl KernelSession {
     ) -> Result<serde_json::Value, crate::error::KSError> {
         use crate::error::KSError;
 
+        // Claim the session before anything of it is changed: an adoption
+        // into a session that has a kernel, or one on its way, is refused
+        let claim = {
+            let mut state = self.state.write().await;
+            state.claim_start("adopting a running kernel", false).await
+        };
+        if let Err(reason) = claim {
+            return Err(KSError::SessionConnectionFailed(anyhow::anyhow!(
+                "{}", reason
+            )));
+        }
+
         // Store the connection file
         let conn_mgr = self.connection_manager();
         conn_mgr
@@ -589,10 +625,21 @@ impl KernelSession {
         // new session is created, before an adopted kernel's real key is
         // known), so it must be used in place of the session's own key for
         // all further communication with this kernel.
-        let connection = self
-            .connection
-            .with_key(&connection_file.info.key)
-            .map_err(KSError::SessionConnectionFailed)?;
+        let connection = match self.connection.with_key(&connection_file.info.key) {
+            Ok(connection) => connection,
+            Err(e) => {
+                // Claimed and connected to nothing: a session that can be
+                // adopted again, started, or deleted
+                let mut state = self.state.write().await;
+                state
+                    .set_status(
+                        models::Status::Exited,
+                        Some(String::from("the adoption failed before it connected")),
+                    )
+                    .await;
+                return Err(KSError::SessionConnectionFailed(e));
+            }
+        };
 
         // Create a channel to receive startup status
         let (startup_tx, startup_rx) = async_channel::unbounded::<StartupStatus>();
@@ -658,10 +705,12 @@ impl KernelSession {
                     "[session {}] Kernel sockets connected successfully; kernel successfully adopted",
                     self.connection.session_id
                 );
-                // Save the kernel info
+                // Save the kernel info. The adopted kernel has answered: the
+                // session goes from `Starting` (the adoption's claim) to idle
                 {
                     let mut state = self.state.write().await;
                     state.set_kernel_info(kernel_info.clone());
+                    state.first_answer("adopted kernel answered").await;
                 }
                 Ok(kernel_info)
             }

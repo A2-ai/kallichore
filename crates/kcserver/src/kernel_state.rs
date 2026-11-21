@@ -149,7 +149,8 @@ impl KernelState {
     ) -> Self {
         KernelState {
             session_id: session.session_id.clone(),
-            status: models::Status::Idle,
+            // A registered session has no kernel until it is started or adopted
+            status: models::Status::Uninitialized,
             working_directory,
             connected: false,
             restart: Weak::new(),
@@ -279,6 +280,59 @@ impl KernelState {
             Some(String::from("heartbeat detected after offline")),
         )
         .await;
+    }
+
+    /// The kernel has given its first answer: the reply to the
+    /// `kernel_info_request` of a start or an adoption.
+    ///
+    /// The answer means the kernel is alive and has finished handling a shell
+    /// request, i.e. it's idle and ready to execute. The status is promoted to
+    /// Idle now rather than waiting for the kernel's startup `status: idle`
+    /// message on iopub, which can be missed if the iopub SUB socket
+    /// subscribes after the kernel emits it (a slow-joiner race that otherwise
+    /// leaves the session stuck in 'starting'), and which an adopted kernel
+    /// does not send at all. Only a startup state is promoted, so a status the
+    /// iopub stream may have already set is not clobbered.
+    pub async fn first_answer(&mut self, reason: &str) {
+        if matches!(
+            self.status,
+            models::Status::Uninitialized | models::Status::Starting | models::Status::Ready
+        ) {
+            self.set_status(models::Status::Idle, Some(String::from(reason)))
+                .await;
+        } else if self.status == models::Status::Offline {
+            // The kernel answered no heartbeat for a while as it started, and
+            // is marked offline. It stays so until its heartbeat is back, and
+            // then goes to idle rather than back to starting.
+            self.first_answer_while_offline();
+        }
+    }
+
+    /// Claims the session for a start or an adoption, which can then launch
+    /// or connect to a kernel: only a session with no kernel can be claimed.
+    /// The claim is the change to `Starting`, made under the state's lock, so
+    /// that of two starts (or a start and an adoption) one goes ahead and the
+    /// other is refused before it has written or launched anything.
+    ///
+    /// `for_restart` is the start a restart makes once the kernel has exited;
+    /// any other start waits for the restart to be over.
+    pub async fn claim_start(&mut self, reason: &str, for_restart: bool) -> Result<(), String> {
+        if self.restarting() && !for_restart {
+            return Err(String::from(
+                "The session is being restarted, and the restart starts its kernel",
+            ));
+        }
+        match self.status {
+            models::Status::Uninitialized | models::Status::Exited => {
+                self.set_status(models::Status::Starting, Some(String::from(reason)))
+                    .await;
+                Ok(())
+            }
+            status => Err(format!(
+                "The session's kernel is {} (started, or being started); a second start would run a second kernel",
+                status
+            )),
+        }
     }
 
     /// The kernel has given its first answer while it is marked offline.
