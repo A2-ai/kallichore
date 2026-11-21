@@ -19,7 +19,7 @@ use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::{select, sync::RwLock};
 use zeromq::{
     util::PeerIdentity, DealerSocket, Socket, SocketEvent, SocketOptions, SocketRecv, SocketSend,
-    SubSocket, ZmqError, ZmqMessage, ZmqResult,
+    SubSocket, ZmqMessage,
 };
 
 use crate::{
@@ -49,25 +49,34 @@ pub struct ZmqWsProxy {
     pub pending_iopub_messages: Vec<ZmqMessage>,
 }
 
-/// How long one attempt to connect to one of a kernel's sockets may take
-/// before a new attempt is made.
-///
-/// The kernel has usually only just been started and may not have bound its
-/// ports yet, so the first attempts are refused. ZeroMQ tries again by itself,
-/// with a pause that doubles after each refusal (up to 30 s), so a kernel that
-/// needs a few seconds to bind is reached long after it is ready. Ending each
-/// attempt after a short time and starting a new one keeps the pause short.
-const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+/// The pause after the first refused connection while waiting for a kernel to
+/// bind a port, and the longest pause; it doubles in between.
+const PORT_WAIT_FIRST_PAUSE: Duration = Duration::from_millis(5);
+const PORT_WAIT_LONGEST_PAUSE: Duration = Duration::from_millis(100);
 
-/// Connects a socket to one of a kernel's endpoints, making a new attempt
-/// whenever one times out (see `CONNECT_ATTEMPT_TIMEOUT`). This does not give
-/// up by itself; the caller bounds it with the session's connection timeout
-/// and ends it if the kernel exits.
-async fn connect_with_retries<S: Socket>(socket: &mut S, endpoint: &str) -> ZmqResult<()> {
+/// Waits until something accepts connections on a TCP port.
+///
+/// A kernel that has only just been started may not have bound its ports
+/// yet, and connections to them are refused until it has. ZeroMQ tries a
+/// refused connection again by itself, but with a pause that doubles after
+/// each refusal, up to 30 s: a kernel that needs a few seconds to bind is
+/// reached long after it is ready. So the port is tried here first, at short
+/// intervals, and the socket is connected once the port accepts.
+///
+/// The connection made to find that out is closed at once. This does not
+/// give up by itself; the caller bounds it with the session's connection
+/// timeout and ends it if the kernel exits. An error other than a refused
+/// connection is returned.
+async fn wait_until_listening(ip: &str, port: i32) -> std::io::Result<()> {
+    let mut pause = PORT_WAIT_FIRST_PAUSE;
     loop {
-        match socket.connect(endpoint).await {
-            Err(ZmqError::ConnectTimeout(_)) => continue,
-            result => return result,
+        match tokio::net::TcpStream::connect((ip, port as u16)).await {
+            Ok(_) => return Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {
+                tokio::time::sleep(pause).await;
+                pause = (pause * 2).min(PORT_WAIT_LONGEST_PAUSE);
+            }
+            Err(e) => return Err(e),
         }
     }
 }
@@ -133,11 +142,12 @@ impl ZmqWsProxy {
     }
 
     /// Creates the socket options shared by the sockets connected to the
-    /// kernel: each connection attempt is bounded, so that it can be made again
-    /// (see `connect_with_retries`).
+    /// kernel. A connection is given no time limit of its own: the session's
+    /// connection timeout bounds the connecting of all four sockets, and a
+    /// limit here could only cut that short.
     fn socket_opts() -> SocketOptions {
         let mut opts = SocketOptions::default();
-        opts.connect_timeout(CONNECT_ATTEMPT_TIMEOUT);
+        opts.no_connect_timeout();
         opts
     }
 
@@ -150,7 +160,16 @@ impl ZmqWsProxy {
         peer_opts
     }
 
-    pub async fn connect(&mut self) -> Result<(), anyhow::Error> {
+    /// Connect to the kernel's shell, iopub, control and stdin sockets, and
+    /// start the heartbeat monitor.
+    ///
+    /// `wait_for_ports` says that the kernel may not have bound its ports
+    /// yet, which is so for a kernel that has just been launched with a
+    /// connection file. Each port is then waited for before its socket is
+    /// connected (see `wait_until_listening`). A kernel that reported its own
+    /// ports in a handshake, or one that is being adopted, is listening on
+    /// them already.
+    pub async fn connect(&mut self, wait_for_ports: bool) -> Result<(), anyhow::Error> {
         // Ensure we're not closed before forwarding the message; this makes it
         // safe to unwrap the sockets below.
         if self.closed {
@@ -168,68 +187,69 @@ impl ZmqWsProxy {
             self.connection_file.info.stdin_port,
         );
 
-        connect_with_retries(
-            self.shell_socket.as_mut().unwrap(),
-            format!(
-                "tcp://{}:{}",
-                self.connection_file.info.ip, self.connection_file.info.shell_port
-            )
-            .as_str(),
-        )
-        .await?;
+        let ip = self.connection_file.info.ip.clone();
 
+        let port = self.connection_file.info.shell_port;
+        if wait_for_ports {
+            wait_until_listening(&ip, port).await?;
+        }
+        self.shell_socket
+            .as_mut()
+            .unwrap()
+            .connect(format!("tcp://{}:{}", ip, port).as_str())
+            .await?;
         log::trace!(
             "[session {}] Connected to shell socket on port {}",
             self.connection.session_id,
-            self.connection_file.info.shell_port
+            port
         );
 
-        connect_with_retries(
-            self.iopub_socket.as_mut().unwrap(),
-            format!(
-                "tcp://{}:{}",
-                self.connection_file.info.ip, self.connection_file.info.iopub_port
-            )
-            .as_str(),
-        )
-        .await?;
+        let port = self.connection_file.info.iopub_port;
+        if wait_for_ports {
+            wait_until_listening(&ip, port).await?;
+        }
+        self.iopub_socket
+            .as_mut()
+            .unwrap()
+            .connect(format!("tcp://{}:{}", ip, port).as_str())
+            .await?;
         log::trace!(
             "[session {}] Connected to iopub socket on port {}",
             self.connection.session_id,
-            self.connection_file.info.iopub_port
+            port
         );
 
         // Subscribe to all messages
         self.iopub_socket.as_mut().unwrap().subscribe("").await?;
 
-        connect_with_retries(
-            self.control_socket.as_mut().unwrap(),
-            format!(
-                "tcp://{}:{}",
-                self.connection_file.info.ip, self.connection_file.info.control_port
-            )
-            .as_str(),
-        )
-        .await?;
+        let port = self.connection_file.info.control_port;
+        if wait_for_ports {
+            wait_until_listening(&ip, port).await?;
+        }
+        self.control_socket
+            .as_mut()
+            .unwrap()
+            .connect(format!("tcp://{}:{}", ip, port).as_str())
+            .await?;
         log::trace!(
             "[session {}] Connected to control socket on port {}",
             self.connection.session_id,
-            self.connection_file.info.control_port
+            port
         );
 
-        connect_with_retries(
-            self.stdin_socket.as_mut().unwrap(),
-            format!(
-                "tcp://{}:{}",
-                self.connection_file.info.ip, self.connection_file.info.stdin_port
-            )
-            .as_str(),
-        )
-        .await?;
+        let port = self.connection_file.info.stdin_port;
+        if wait_for_ports {
+            wait_until_listening(&ip, port).await?;
+        }
+        self.stdin_socket
+            .as_mut()
+            .unwrap()
+            .connect(format!("tcp://{}:{}", ip, port).as_str())
+            .await?;
         log::trace!(
             "[session {}] Connected to stdin socket on port {}",
             self.connection.session_id,
-            self.connection_file.info.stdin_port
+            port
         );
 
         // Sockets are connected; start the heartbeat monitor
