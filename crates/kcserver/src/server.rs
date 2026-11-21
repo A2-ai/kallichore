@@ -67,7 +67,6 @@ use crate::connection_file::{self, ConnectionFile};
 use crate::error::KSError;
 use crate::kernel_session::{self, ExecuteError, ExecuteOptions, KernelSession};
 use crate::registration_file::RegistrationFile;
-use crate::registration_socket::HandshakeResult;
 use crate::websocket_service::WebsocketInterceptorMakeService;
 use crate::working_dir;
 use crate::zmq_ws_proxy::{self, ZmqWsProxy};

@@ -31,7 +31,7 @@ use tokio::sync::RwLock;
 use crate::{
     connection_file::ConnectionFile, execution_history::RECENT_ENTRIES,
     kernel_connection::KernelConnection, kernel_state::KernelState, mcp::McpState,
-    registration_socket::{HandshakeResult, RegistrationSocket},
+    registration_socket::RegistrationSocket,
     startup_status::StartupStatus,
 };
 
@@ -46,13 +46,6 @@ use startup::StartupCoordinator;
 // Re-export utility functions for external use
 pub use execute::{ExecuteError, ExecuteOptions};
 pub use utils::make_message_id;
-
-/// The socket a kernel that performs the JEP 66 handshake registers on, and
-/// the channel the handshake's result arrives on.
-type Registration = (
-    RegistrationSocket,
-    tokio::sync::oneshot::Receiver<HandshakeResult>,
-);
 
 /// How long a start that has failed waits for the process it launched to be
 /// stopped before it reports the failure anyway.
@@ -293,7 +286,7 @@ impl KernelSession {
         });
 
         // If JEP 66 is enabled, wait for the handshake
-        if let Some((registration_socket, handshake_result_rx)) = registration {
+        if let Some(registration_socket) = registration {
             log::info!(
                 "[session {}] Waiting for JEP 66 handshake",
                 self.connection.session_id
@@ -310,12 +303,7 @@ impl KernelSession {
             );
 
             match handshake_coord
-                .wait_for_handshake(
-                    registration_socket,
-                    handshake_result_rx,
-                    startup_rx.clone(),
-                    connection_timeout,
-                )
+                .wait_for_handshake(registration_socket, startup_rx.clone(), connection_timeout)
                 .await
             {
                 Ok(connection_file) => {
@@ -393,7 +381,7 @@ impl KernelSession {
         coordinator: &mut StartupCoordinator,
         working_directory: &str,
         jep66_enabled: bool,
-    ) -> Result<(tokio::process::Child, Option<Registration>), StartupError> {
+    ) -> Result<(tokio::process::Child, Option<RegistrationSocket>), StartupError> {
         // Set up connection or registration file
         let (connection_file_path, registration) = if jep66_enabled {
             log::info!(
@@ -411,8 +399,8 @@ impl KernelSession {
                 None, // startup_command not yet determined
             );
 
-            let (path, socket, rx) = handshake_coord.setup_registration_socket().await?;
-            (path, Some((socket, rx)))
+            let (path, socket) = handshake_coord.setup_registration_socket().await?;
+            (path, Some(socket))
         } else {
             // Traditional kernel - generate connection file
             let connection_file = ConnectionFile::generate(
