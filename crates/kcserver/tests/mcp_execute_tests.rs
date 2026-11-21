@@ -26,7 +26,8 @@ use futures::{SinkExt, StreamExt};
 use kallichore_api::models::Status;
 use kallichore_api::models::{ExecuteRequest, InterruptMode};
 use kallichore_api::{
-    ApiNoContext, GetSessionHistoryResponse, GetSessionResponse, StartSessionResponse,
+    ApiNoContext, ExecuteCodeResponse, GetSessionHistoryResponse, GetSessionResponse,
+    StartSessionResponse,
 };
 use kcshared::kernel_message::KernelMessage;
 use kcshared::mcp_frontend::{ForegroundChanged, FrontendHello, FrontendMessage, SessionsChanged};
@@ -858,6 +859,96 @@ async fn test_history_records_what_ran_and_who_ran_it() {
     let result = agent.call_tool("list_sessions", json!({})).await;
     let recent = &result.field("sessions")[0]["recent_history"];
     assert_eq!(recent.as_array().unwrap().len(), 3, "{:?}", result);
+}
+
+/// A server started with `--execution-history-entries 0` runs code as before
+/// but keeps none of it: no history over REST, with the session's details, or
+/// over MCP, which says that none is kept.
+#[tokio::test]
+async fn test_a_server_told_to_keep_no_history_keeps_none() {
+    let python_cmd = require_ipykernel!();
+    let server = TestServer::start_http_with_args(&["--execution-history-entries", "0"]).await;
+    let client = server.create_client().await;
+    let session_id = start_session(&client, &python_cmd).await;
+    let (_workspace_id, _window, mut agent) = agent_for(&server, &[&session_id]).await;
+
+    let result = agent
+        .call_tool(
+            "execute_code",
+            json!({ "code": "print('hi')\n21 * 2", "session_id": session_id }),
+        )
+        .await;
+    assert!(!result.is_error, "{:?}", result);
+    assert_eq!(result.field("status"), &json!("ok"));
+    assert!(
+        result.field("stdout").as_str().unwrap_or("").contains("hi"),
+        "the code still runs and its output still comes back: {:?}",
+        result
+    );
+    match client
+        .execute_code(
+            session_id.clone(),
+            ExecuteRequest::new("print('from rest')".to_string()),
+        )
+        .await
+        .expect("Failed to execute code")
+    {
+        ExecuteCodeResponse::ExecutionCompleted(reply) => {
+            let stdout: String = reply
+                .output
+                .iter()
+                .filter_map(|o| o.text.as_deref())
+                .collect();
+            assert!(stdout.contains("from rest"), "{:?}", reply);
+        }
+        other => panic!("Unexpected response: {:?}", other),
+    }
+
+    let history = match client
+        .get_session_history(session_id.clone())
+        .await
+        .expect("Failed to get history")
+    {
+        GetSessionHistoryResponse::ExecutionHistory(history) => history,
+        other => panic!("Unexpected response: {:?}", other),
+    };
+    assert!(history.is_empty(), "{:?}", history);
+    match client
+        .get_session(session_id.clone())
+        .await
+        .expect("Failed to get session")
+    {
+        GetSessionResponse::SessionDetails(details) => {
+            assert!(
+                details.history.unwrap_or_default().is_empty(),
+                "the session's details carry no history"
+            );
+        }
+        other => panic!("Unexpected response: {:?}", other),
+    }
+
+    let result = agent
+        .call_tool("get_session_history", json!({ "session_id": session_id }))
+        .await;
+    assert!(!result.is_error, "{:?}", result);
+    assert_eq!(result.field("total"), &json!(0));
+    assert_eq!(result.field("entries"), &json!([]));
+    assert!(
+        result
+            .field("note")
+            .as_str()
+            .unwrap_or("")
+            .contains("keeps no execution history"),
+        "{:?}",
+        result
+    );
+    let result = agent.call_tool("list_sessions", json!({})).await;
+    let recent = &result.field("sessions")[0]["recent_history"];
+    assert!(
+        recent.as_array().map_or(true, |r| r.is_empty()),
+        "{:?}",
+        result
+    );
 }
 
 #[tokio::test]

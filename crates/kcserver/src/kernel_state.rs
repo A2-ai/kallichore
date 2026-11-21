@@ -19,7 +19,7 @@ use kcshared::{
 use tokio::sync::mpsc;
 
 use crate::connection_file::{ConnectionFile, PortReservation};
-use crate::execution_history::ExecutionHistory;
+use crate::execution_history::{entries_kept, ExecutionHistory};
 use crate::execution_queue::ExecutionQueue;
 
 #[cfg(not(target_os = "windows"))]
@@ -162,7 +162,7 @@ impl KernelState {
             restart: Weak::new(),
             process_id: None,
             execution_queue: ExecutionQueue::new(),
-            history: ExecutionHistory::default(),
+            history: ExecutionHistory::keeping(entries_kept()),
             env_vars: session.env.clone(),
             resolved_env: HashMap::new(),
             input_prompt: session.input_prompt.clone(),
