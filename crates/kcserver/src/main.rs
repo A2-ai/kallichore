@@ -196,6 +196,13 @@ struct Args {
     #[arg(long, action = clap::ArgAction::Set, default_value_t = true)]
     resource_include_children: bool,
 
+    /// The most executions each session remembers (the code, and a clipped
+    /// copy of what it printed, returned or raised), reported with the
+    /// session and through its history. 0 keeps none: no session holds any
+    /// code or output it ran.
+    #[arg(long, default_value_t = execution_history::MAX_ENTRIES)]
+    execution_history_entries: usize,
+
     /// The log level to use. Valid values are "trace", "debug", "info", "warn",
     /// and "error". If not specified, the default log level is "info", or the
     /// value of `RUST_LOG` if set.
@@ -500,6 +507,12 @@ async fn main() {
 
     // Convert the transport to a server listener
     let server_listener = transport.into_server_listener();
+
+    // How many executions each session remembers (none with 0)
+    execution_history::set_entries_kept(args.execution_history_entries);
+    if args.execution_history_entries == 0 {
+        log::info!("Sessions keep no execution history (--execution-history-entries 0)");
+    }
 
     // Determine the resource monitor settings (sampling defaults to 1000ms)
     let resource_config = resource_monitor::ResourceMonitorConfig {

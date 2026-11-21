@@ -10,19 +10,37 @@
 //!
 //! Every part of an entry is clipped as it arrives, and only the most recent
 //! entries are kept, so the history never holds more than
-//! `MAX_ENTRIES * (MAX_INPUT_BYTES + MAX_OUTPUT_BYTES + MAX_ERROR_BYTES)`
-//! bytes of text, however much output a kernel produces.
+//! `entries_kept() * (MAX_INPUT_BYTES + MAX_OUTPUT_BYTES + MAX_ERROR_BYTES)`
+//! bytes of text, however much output a kernel produces. A server started
+//! with `--execution-history-entries 0` keeps none: no code or output is
+//! held for any session.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::Utc;
 use kallichore_api::models;
 use kcshared::jupyter_message::JupyterMessage;
 use serde_json::Value;
 
-/// The most executions a session remembers.
+/// The most executions a session remembers unless the server is told
+/// otherwise (`--execution-history-entries`).
 pub const MAX_ENTRIES: usize = 100;
+
+/// How many executions each new session remembers; set once at startup.
+static ENTRIES_KEPT: AtomicUsize = AtomicUsize::new(MAX_ENTRIES);
+
+/// Set how many executions each session created from now on remembers. 0
+/// remembers none.
+pub fn set_entries_kept(entries: usize) {
+    ENTRIES_KEPT.store(entries, Ordering::Relaxed);
+}
+
+/// How many executions each new session remembers.
+pub fn entries_kept() -> usize {
+    ENTRIES_KEPT.load(Ordering::Relaxed)
+}
 
 /// The most executions reported with a session's details.
 pub const RECENT_ENTRIES: usize = 3;
@@ -40,9 +58,17 @@ const MAX_ERROR_BYTES: usize = 4 * 1024;
 const MAX_ERROR_NAME_BYTES: usize = 256;
 
 /// The executions a session has run, oldest first.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ExecutionHistory {
     entries: VecDeque<Entry>,
+    /// The most entries kept; 0 keeps none.
+    kept: usize,
+}
+
+impl Default for ExecutionHistory {
+    fn default() -> Self {
+        Self::keeping(MAX_ENTRIES)
+    }
 }
 
 #[derive(Debug)]
@@ -59,6 +85,14 @@ struct Entry {
 }
 
 impl ExecutionHistory {
+    /// A history that remembers at most `kept` executions (none when 0).
+    pub fn keeping(kept: usize) -> Self {
+        ExecutionHistory {
+            entries: VecDeque::new(),
+            kept,
+        }
+    }
+
     /// Start an entry for an `execute_request` being sent to the kernel.
     /// Silent requests are not recorded, since the kernel reports nothing for
     /// them.
@@ -67,8 +101,11 @@ impl ExecutionHistory {
         if content["silent"].as_bool() == Some(true) {
             return;
         }
+        if self.kept == 0 {
+            return;
+        }
         let attribution = &request.metadata["attribution"];
-        if self.entries.len() == MAX_ENTRIES {
+        while self.entries.len() >= self.kept {
             self.entries.pop_front();
         }
         self.entries.push_back(Entry {
@@ -399,6 +436,31 @@ mod tests {
         assert_eq!(traceback.last(), frames.last());
         assert!(traceback.len() * 4 <= MAX_ERROR_BYTES);
         assert!(entry.truncated);
+    }
+
+    #[test]
+    fn keeps_only_as_many_executions_as_it_is_told() {
+        let mut history = ExecutionHistory::keeping(2);
+        for i in 0..5 {
+            history.begin(&request(&i.to_string(), &i.to_string(), false));
+        }
+        let inputs: Vec<String> = history.entries().into_iter().map(|e| e.input).collect();
+        assert_eq!(inputs, vec!["3", "4"]);
+    }
+
+    #[test]
+    fn keeping_none_records_nothing() {
+        let mut history = ExecutionHistory::keeping(0);
+        history.begin(&request("a", "secret <- 1", false));
+        history.record(&message(
+            "stream",
+            Some("a"),
+            json!({ "name": "stdout", "text": "secret" }),
+            json!({}),
+        ));
+        assert_eq!(history.count(), 0);
+        assert!(history.entries().is_empty());
+        assert!(history.recent(3).is_empty());
     }
 
     #[test]

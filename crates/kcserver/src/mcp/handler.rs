@@ -44,6 +44,7 @@ use tokio::sync::mpsc;
 
 use super::workspaces::CommandOutcome;
 use super::McpState;
+use crate::execution_history::entries_kept;
 use crate::kernel_session::{ExecuteError, ExecuteOptions, KernelSession};
 
 /// The most text one tool result may carry. Beyond this the result is trimmed
@@ -337,8 +338,9 @@ impl PositronMcpHandler {
                        Positron Assistant; 'extension' is a Positron extension. With no source, \
                        the submitter is unknown. Use this to see \
                        what the user has been doing or why something they ran failed, without \
-                       running anything. Only the last 100 executions are kept, and long input \
-                       and output are clipped in the middle.",
+                       running anything. Only the most recent executions are kept (100 unless \
+                       the server was started with another number, none when it was started \
+                       to keep none), and long input and output are clipped in the middle.",
         annotations(title = "Get session history", read_only_hint = true)
     )]
     async fn get_session_history(
@@ -360,13 +362,17 @@ impl PositronMcpHandler {
         };
         let (entries, truncated) = render_history(recent, MAX_TEXT_BYTES);
 
-        let body = json!({
+        let mut body = json!({
             "session_id": session.connection.session_id,
             "display_name": session.model.display_name,
             "entries": entries,
             "total": total,
             "truncated": truncated,
         });
+        if entries_kept() == 0 {
+            body["note"] =
+                json!("This server keeps no execution history: what sessions ran is not recorded.");
+        }
         Ok(self.finish(body, Vec::new()).await)
     }
 
