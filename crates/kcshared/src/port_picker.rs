@@ -6,7 +6,9 @@
 //
 //
 
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddrV4, SocketAddrV6, TcpListener, ToSocketAddrs};
+use std::net::{
+    IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, TcpListener, ToSocketAddrs,
+};
 
 // Try to bind to a socket using TCP
 fn test_bind_tcp<A: ToSocketAddrs>(addr: A) -> Option<u16> {
@@ -34,4 +36,52 @@ pub fn pick_unused_tcp_port() -> Option<u16> {
         }
     }
     None
+}
+
+/// Picks a TCP port that is available on the given address.
+///
+/// A port is only free on the address it was tested on. A port the OS gives
+/// out for the unspecified address can be one that another process is
+/// listening on at a specific address such as 127.0.0.1 (macOS does this), so
+/// when the address the port will be bound on is known, ask for a port there.
+pub fn pick_unused_tcp_port_on(ip: IpAddr) -> Option<u16> {
+    // Try up to 5 times to find a free port
+    for _ in 0..5 {
+        if let Some(port) = test_bind_tcp(SocketAddr::new(ip, 0)) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port picked on an address is not one that already has a listener on
+    /// that address.
+    ///
+    /// Picks more ports than the ephemeral range holds, so that an allocator
+    /// that hands ports out in sequence comes round to the listeners' ports.
+    #[test]
+    fn picks_a_port_with_no_listener_on_the_address() {
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let listeners: Vec<TcpListener> = (0..32)
+            .map(|_| TcpListener::bind(SocketAddr::new(ip, 0)).unwrap())
+            .collect();
+        let held: Vec<u16> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect();
+
+        for _ in 0..70_000 {
+            let port = pick_unused_tcp_port_on(ip).unwrap();
+            assert!(
+                !held.contains(&port),
+                "picked port {}, which has a listener on {}",
+                port,
+                ip
+            );
+        }
+    }
 }
