@@ -113,7 +113,13 @@ async fn read_to_the_end(ws: &mut Ws, at_most: Duration, read: &mut Read) {
     loop {
         match tokio::time::timeout_at(deadline, ws.next()).await {
             Ok(Some(Ok(Message::Text(text)))) => read.take(&text),
-            Ok(Some(Ok(Message::Close(_)))) | Ok(Some(Err(_))) | Ok(None) => {
+            Ok(Some(Ok(Message::Close(_)))) => {
+                // Reading once more sends this side's close in answer
+                read.ended = true;
+                let _ = tokio::time::timeout(Duration::from_secs(1), ws.next()).await;
+                return;
+            }
+            Ok(Some(Err(_))) | Ok(None) => {
                 read.ended = true;
                 return;
             }
@@ -258,13 +264,14 @@ async fn wait_for_status(
     }
 }
 
-/// A client that has stopped reading its connection, while the kernel has a
-/// lot to say, is still replaced when another client connects: it is
-/// disconnected, the session's messages from then on all go to the new
-/// client, and the session stays connected when the old connection ends.
+/// A client that had stopped reading its connection, while the kernel had a
+/// lot to say, is still replaced when another client connects: it is told
+/// and its connection is closed, the session's messages from then on all go
+/// to the new client, and the session stays connected.
 ///
 /// The first client here asks for 24 MB of output and reads none of it, so
 /// the server is in the middle of a write to it when the second connects.
+/// From then on the first client reads again.
 #[tokio::test]
 async fn test_client_that_is_not_reading_is_replaced() {
     let result = tokio::time::timeout(Duration::from_secs(180), async {
@@ -275,7 +282,7 @@ async fn test_client_that_is_not_reading_is_replaced() {
         // The first client asks for more output than its connection can hold
         // and reads none of it
         let mut first = connect_session_ws(&server, &session_id).await;
-        let flood = execute(
+        execute(
             &mut first,
             "import sys, time\ntime.sleep(0.5)\nfor i in range(48):\n    sys.stdout.write('x' * 524288 + '\\n')\n    sys.stdout.flush()\n",
         )
@@ -283,49 +290,21 @@ async fn test_client_that_is_not_reading_is_replaced() {
         wait_for_status(&client, &session_id, models::Status::Busy, Duration::from_secs(10)).await;
         wait_for_status(&client, &session_id, models::Status::Idle, Duration::from_secs(60)).await;
 
-        // The second client connects, and reads until it has been sent the
-        // last of what the kernel published for that request. (The reply to
-        // the request is no mark of that: it comes on another socket, ahead
-        // of most of the output.)
+        // The second client connects. The first reads again from here on:
+        // what was already on its way to it, and then, if it has been
+        // replaced, the message that says so and the end of its connection.
         let mut second = connect_session_ws(&server, &session_id).await;
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
-        loop {
-            let next = tokio::time::timeout_at(deadline, second.next())
-                .await
-                .expect("the second client should be sent the rest of the kernel's output")
-                .expect("the second client's connection ended")
-                .expect("the second client's connection failed");
-            let Message::Text(text) = next else { continue };
-            let Ok(WebsocketMessage::Jupyter(message)) =
-                serde_json::from_str::<WebsocketMessage>(&text)
-            else {
-                continue;
-            };
-            let is_the_last = message.header.msg_type == "status"
-                && message.content["execution_state"] == "idle"
-                && message
-                    .parent_header
-                    .as_ref()
-                    .is_some_and(|parent| parent.msg_id == flood);
-            if is_the_last {
-                break;
-            }
-        }
-
-        // The first client reads again: what was already on its way to it,
-        // and then the end of its connection
-        let mut first_read = Read::default();
-        read_to_the_end(&mut first, Duration::from_secs(10), &mut first_read).await;
-
-        // The second client runs 40 small pieces of code. The first goes on
-        // reading, if its connection is still there.
-        print_markers(&mut second, 40).await;
         let first_reading = tokio::spawn(async move {
-            read_to_the_end(&mut first, Duration::from_secs(10), &mut first_read).await;
-            (first, first_read)
+            let mut read = Read::default();
+            read_to_the_end(&mut first, Duration::from_secs(15), &mut read).await;
+            (first, read)
         });
+
+        // The second client runs 40 small pieces of code, and is sent their
+        // output after the rest of the first client's
+        print_markers(&mut second, 40).await;
         let mut second_read = Read::default();
-        read_markers(&mut second, 40, Duration::from_secs(20), &mut second_read).await;
+        read_markers(&mut second, 40, Duration::from_secs(30), &mut second_read).await;
         let (first, first_read) = first_reading
             .await
             .expect("reading the first client failed");
@@ -341,6 +320,10 @@ async fn test_client_that_is_not_reading_is_replaced() {
             second_read.markers,
             (0..40).collect::<Vec<usize>>(),
             "the new client should be sent the output of every one of its 40 requests"
+        );
+        assert!(
+            first_read.told_it_was_replaced,
+            "the client that was replaced should have been told so"
         );
         assert!(
             first_read.ended,
