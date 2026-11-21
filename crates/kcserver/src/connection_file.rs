@@ -17,7 +17,7 @@ use kallichore_api::models::ConnectionInfo;
 use kcshared::handshake_protocol::HandshakeVersion;
 use serde::{Deserialize, Serialize};
 
-use kcshared::port_picker::pick_unused_tcp_port;
+use kcshared::port_picker::{pick_unused_tcp_port, pick_unused_tcp_port_on};
 
 /// The contents of the Connection File as listed in the Jupyter specfication;
 /// directly parsed from JSON.
@@ -53,11 +53,18 @@ impl ConnectionFile {
     /// # Arguments
     ///
     /// * `name` - The name of the port to find. This is used for logging.
+    /// * `ip` - The address the kernel will bind the port on.
     /// * `reserved_ports` - A list of ports that should not be used.
     fn find_port(
         name: String,
+        ip: &str,
         reserved_ports: Arc<RwLock<Vec<i32>>>,
     ) -> Result<u16, anyhow::Error> {
+        // Ask for the port on the address the kernel will bind, so that a
+        // port another process is listening on at that address is not picked.
+        // An `ip` that is not an IP address is tested on the unspecified one.
+        let ip: Option<std::net::IpAddr> = ip.parse().ok();
+
         // The current candidate port; 0 indicates we haven't found one yet
         let mut port = 0;
 
@@ -66,7 +73,11 @@ impl ConnectionFile {
 
         while port == 0 {
             // Find a free port
-            let candidate = match pick_unused_tcp_port() {
+            let picked = match ip {
+                Some(ip) => pick_unused_tcp_port_on(ip),
+                None => pick_unused_tcp_port(),
+            };
+            let candidate = match picked {
                 Some(port) => port,
                 None => {
                     return Err(anyhow::anyhow!(
@@ -134,11 +145,15 @@ impl ConnectionFile {
         key: Option<String>,
     ) -> Result<Self, anyhow::Error> {
         let control_port =
-            ConnectionFile::find_port(String::from("control"), reserved_ports.clone())?;
-        let shell_port = ConnectionFile::find_port(String::from("shell"), reserved_ports.clone())?;
-        let iopub_port = ConnectionFile::find_port(String::from("iopub"), reserved_ports.clone())?;
-        let hb_port = ConnectionFile::find_port(String::from("heartbeat"), reserved_ports.clone())?;
-        let stdin_port = ConnectionFile::find_port(String::from("stdin"), reserved_ports.clone())?;
+            ConnectionFile::find_port(String::from("control"), &ip, reserved_ports.clone())?;
+        let shell_port =
+            ConnectionFile::find_port(String::from("shell"), &ip, reserved_ports.clone())?;
+        let iopub_port =
+            ConnectionFile::find_port(String::from("iopub"), &ip, reserved_ports.clone())?;
+        let hb_port =
+            ConnectionFile::find_port(String::from("heartbeat"), &ip, reserved_ports.clone())?;
+        let stdin_port =
+            ConnectionFile::find_port(String::from("stdin"), &ip, reserved_ports.clone())?;
         let info = ConnectionInfo {
             control_port: control_port.into(),
             shell_port: shell_port.into(),
