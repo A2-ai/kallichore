@@ -91,6 +91,11 @@ pub struct KernelState {
     /// The Unix domain socket path for the current client, if any.
     pub client_socket_path: Option<String>,
 
+    /// The ID of the client the session is connected to, if any. A client
+    /// that another has taken the place of is no longer it, and does not
+    /// mark the session disconnected when its own connection ends.
+    connected_client: Option<String>,
+
     /// The kernel information, as returned by the kernel_info_request message.
     pub kernel_info: Option<serde_json::Value>,
 
@@ -137,6 +142,7 @@ impl KernelState {
             connection_file: None,
             connection_file_ports: None,
             client_socket_path: None,
+            connected_client: None,
             kernel_info: None,
             resource_usage: None,
             rpc_listeners: HashMap::new(),
@@ -159,7 +165,29 @@ impl KernelState {
         self.nudge_idle().await;
     }
 
-    /// Set the Unix domain socket path for the current client
+    /// Records that the client `client_id` is now the session's client, in
+    /// place of any client before it.
+    pub async fn client_connected(&mut self, client_id: &str, socket_path: Option<String>) {
+        self.connected_client = Some(client_id.to_string());
+        self.client_socket_path = socket_path;
+        self.set_connected(true).await;
+    }
+
+    /// Records that the connection of the client `client_id` has ended. If
+    /// another client has taken its place since, the session is still
+    /// connected, to that one, and nothing changes.
+    pub fn client_disconnected(&mut self, client_id: &str) {
+        if self.connected_client.as_deref() != Some(client_id) {
+            return;
+        }
+        self.connected_client = None;
+        self.connected = false;
+        self.client_socket_path = None;
+    }
+
+    /// Set the Unix domain socket path for the current client. Only the
+    /// handler of a named pipe's raw protocol sets it by itself.
+    #[cfg(windows)]
     pub fn set_client_socket_path(&mut self, socket_path: Option<String>) {
         self.client_socket_path = socket_path;
     }
@@ -379,6 +407,38 @@ mod tests {
         let mut state = KernelState::new(session, String::new(), idle_nudge_tx, ws_json_tx);
         state.set_status(status, None).await;
         (state, idle_nudge_rx, ws_json_rx)
+    }
+
+    #[tokio::test]
+    async fn a_client_whose_connection_ends_leaves_the_session_disconnected() {
+        let (mut state, _nudges, _messages) = state_in(Status::Idle).await;
+        state
+            .client_connected("first", Some("/a/socket".to_string()))
+            .await;
+        assert!(state.connected);
+        assert_eq!(state.client_socket_path.as_deref(), Some("/a/socket"));
+
+        state.client_disconnected("first");
+        assert!(!state.connected);
+        assert_eq!(state.client_socket_path, None);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_client_whose_connection_ends_leaves_the_session_connected() {
+        let (mut state, _nudges, _messages) = state_in(Status::Idle).await;
+        state.client_connected("first", None).await;
+        state
+            .client_connected("second", Some("/a/socket".to_string()))
+            .await;
+
+        // The first client's connection ends after the second took its place
+        state.client_disconnected("first");
+        assert!(state.connected);
+        assert_eq!(state.client_socket_path.as_deref(), Some("/a/socket"));
+
+        state.client_disconnected("second");
+        assert!(!state.connected);
+        assert_eq!(state.client_socket_path, None);
     }
 
     #[tokio::test]

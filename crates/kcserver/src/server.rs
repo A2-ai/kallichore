@@ -2410,7 +2410,7 @@ impl<C> Server<C> {
                     let session = client_sessions.get(pos).unwrap();
                     // Disconnect the existing session
                     log::debug!("Disconnecting existing client session for '{}'", session_id);
-                    session.disconnect.notify(usize::MAX);
+                    session.disconnect.cancel();
                     // Remove the existing session
                     client_sessions.remove(pos);
                 }
@@ -2716,7 +2716,7 @@ impl<C> Server<C> {
                     Some(pos) => {
                         let session = client_sessions_guard.get(pos).unwrap();
                         log::debug!("Disconnecting existing client session for '{}'", session_id);
-                        session.disconnect.notify(usize::MAX);
+                        session.disconnect.cancel();
                         client_sessions_guard.remove(pos);
                     }
                     None => {
