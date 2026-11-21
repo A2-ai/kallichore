@@ -279,12 +279,16 @@ async fn check_failed_handshake_releases_the_registration_port(kernel_command: &
     let client = server.create_client().await;
 
     let session_id = format!("failed-start-test-{}", Uuid::new_v4());
+    // The "kernel" keeps a copy of the file it was given, which names the
+    // port: kcserver removes the file itself once the start has failed
+    let copy = std::env::temp_dir().join(format!("{}.registration.json", session_id));
     let mut session = create_test_session(session_id.clone(), "/bin/sh");
     session.argv = vec![
         "/bin/sh".to_string(),
         "-c".to_string(),
-        kernel_command.to_string(),
+        format!("cp \"$0\" \"$1\"; {}", kernel_command),
         "{connection_file}".to_string(),
+        copy.to_string_lossy().to_string(),
     ];
     session.connection_timeout = Some(2);
     session.protocol_version = Some("5.5".to_string());
@@ -303,12 +307,19 @@ async fn check_failed_handshake_releases_the_registration_port(kernel_command: &
         response
     );
 
-    // The file the kernel was given names the port
+    // The file the kernel was given names the port; the file itself is gone
     let registration_file = std::env::temp_dir().join(format!("registration_{}.json", session_id));
+    assert!(
+        !registration_file.exists(),
+        "{} should be removed once the start has failed",
+        registration_file.display()
+    );
     let registration: serde_json::Value = serde_json::from_str(
-        &std::fs::read_to_string(&registration_file).expect("the registration file should exist"),
+        &std::fs::read_to_string(&copy)
+            .expect("the kernel's copy of its registration file should exist"),
     )
     .expect("the registration file should be JSON");
+    let _ = std::fs::remove_file(&copy);
     let port = registration["registration_port"]
         .as_u64()
         .expect("the registration file should name a port") as u16;
