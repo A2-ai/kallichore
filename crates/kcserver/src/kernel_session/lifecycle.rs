@@ -9,15 +9,30 @@
 //! Kernel lifecycle management (restart, shutdown, interrupt).
 
 use async_channel::{SendError, Sender};
-use event_listener::Event;
 use kallichore_api::models::{self, StartupError, VarAction};
 use kcshared::jupyter_message::{JupyterChannel, JupyterMessage, JupyterMessageHeader};
 use std::{fs, sync::Arc};
 use tokio::sync::RwLock;
 
-use crate::{error::KSError, kernel_state::KernelState, working_dir::expand_path};
+use crate::{
+    error::KSError,
+    kernel_state::{KernelState, RestartClaim},
+    working_dir::expand_path,
+};
 
 use super::utils::make_message_id;
+
+/// The error for a restart that is refused before anything is asked of the
+/// kernel.
+fn refused(reason: &str) -> StartupError {
+    let err = KSError::RestartFailed(anyhow::anyhow!("{}", reason));
+    err.log();
+    StartupError {
+        exit_code: None,
+        output: None,
+        error: err.to_json(None),
+    }
+}
 
 /// Manages kernel lifecycle operations.
 pub struct LifecycleManager {
@@ -30,9 +45,6 @@ pub struct LifecycleManager {
     /// Channel to send ZMQ messages to the kernel
     ws_zmq_tx: Sender<JupyterMessage>,
 
-    /// Event that fires when the process exits
-    exit_event: Arc<Event>,
-
     /// Original working directory from the model
     #[allow(dead_code)]
     original_working_directory: String,
@@ -44,14 +56,12 @@ impl LifecycleManager {
         session_id: String,
         state: Arc<RwLock<KernelState>>,
         ws_zmq_tx: Sender<JupyterMessage>,
-        exit_event: Arc<Event>,
         original_working_directory: String,
     ) -> Self {
         Self {
             session_id,
             state,
             ws_zmq_tx,
-            exit_event,
             original_working_directory,
         }
     }
@@ -95,13 +105,16 @@ impl LifecycleManager {
     ///
     /// # Returns
     ///
-    /// `Ok(())` if the kernel was restarted successfully, or an error if the
-    /// kernel could not be restarted.
+    /// The claim of the restart that has begun, once the kernel has been
+    /// asked to shut down; the caller keeps it until the restart is over. An
+    /// error if the kernel cannot be restarted: a restart is in progress
+    /// already, or the kernel has exited, so that there is nothing to shut
+    /// down and no exit to wait for.
     pub async fn restart(
         &self,
         working_directory: Option<String>,
         env: Option<Vec<VarAction>>,
-    ) -> Result<(), StartupError> {
+    ) -> Result<RestartClaim, StartupError> {
         // Expand the working directory if it was supplied
         let working_directory = match working_directory {
             Some(dir) => match expand_path(dir.clone()) {
@@ -151,16 +164,18 @@ impl LifecycleManager {
         };
 
         // Enter the restarting state.
-        {
+        let claim = {
             let mut state = self.state.write().await;
-            if state.restarting {
-                let err = KSError::RestartFailed(anyhow::anyhow!("Kernel is already restarting"));
-                err.log();
-                return Err(StartupError {
-                    exit_code: None,
-                    output: None,
-                    error: err.to_json(None),
-                });
+            if state.restarting() {
+                return Err(refused("Kernel is already restarting"));
+            }
+
+            // A kernel that has exited cannot be asked to shut down, and will
+            // not exit again: a restart that waited for that would never end.
+            if state.status == models::Status::Exited {
+                return Err(refused(
+                    "The kernel has exited, so there is nothing to restart; start the session to run it again",
+                ));
             }
 
             // Set the working directory.
@@ -206,20 +221,19 @@ impl LifecycleManager {
                 state.env_vars = env;
             }
 
-            state.restarting = true;
-        }
+            match state.begin_restart() {
+                Some(claim) => claim,
+                None => return Err(refused("Kernel is already restarting")),
+            }
+        };
 
         match self.shutdown_request(true).await {
             Ok(_) => {
                 log::debug!("Preparing for restart; sent shutdown request to kernel");
             }
             Err(e) => {
-                // Leave the restarting state since we failed to send the
-                // shutdown request.
-                {
-                    let mut state = self.state.write().await;
-                    state.restarting = false;
-                }
+                // The restarting state is left as the claim is dropped,
+                // since we failed to send the shutdown request.
                 let err = KSError::RestartFailed(anyhow::anyhow!(
                     "Failed to send shutdown request to kernel"
                 ));
@@ -231,34 +245,12 @@ impl LifecycleManager {
             }
         }
 
-        // Wait for the kernel to exit and then restart it
+        // The caller waits for the kernel to exit and then starts it again
         log::debug!(
             "[session {}] Waiting for kernel to exit before restarting",
             self.session_id
         );
-        Ok(())
-    }
-
-    /// Complete restart by waiting for the kernel to exit and then starting it again.
-    ///
-    /// This should be called after `restart()` sends the shutdown request.
-    /// It returns when the kernel has exited and can be started again.
-    pub async fn wait_for_exit_and_signal(&self) -> bool {
-        // Wait for the kernel to exit
-        let listener = self.exit_event.listen();
-        listener.await;
-
-        // Check if the kernel is still restarting, and clear the restarting flag
-        let mut state = self.state.write().await;
-        if !state.restarting {
-            log::debug!(
-                "[session {}] Kernel is no longer restarting; stopping restart",
-                self.session_id
-            );
-            return false;
-        }
-        state.restarting = false;
-        true
+        Ok(claim)
     }
 
     /// Interrupt the kernel.
