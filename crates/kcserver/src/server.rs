@@ -1491,12 +1491,13 @@ where
             }
         };
 
-        // Ensure the session is not running
+        // Ensure the session is not running: its kernel has exited, or it never
+        // had one (it was registered and not started or adopted)
         let status = {
             let state = kernel_session.state.read().await;
             state.status.clone()
         };
-        if status != models::Status::Exited {
+        if status != models::Status::Exited && status != models::Status::Uninitialized {
             let error = KSError::SessionRunning(session_id.clone());
             error.log();
             return Ok(DeleteSessionResponse::FailedToDeleteSession(

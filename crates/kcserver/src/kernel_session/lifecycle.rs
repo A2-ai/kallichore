@@ -178,6 +178,13 @@ impl LifecycleManager {
                 ));
             }
 
+            // Nor can a session whose kernel was never started or adopted
+            if state.status == models::Status::Uninitialized {
+                return Err(refused(
+                    "The session has not been started, so there is nothing to restart; start the session to run it",
+                ));
+            }
+
             // Set the working directory.
             match working_directory {
                 Some(dir) => {
