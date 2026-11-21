@@ -96,6 +96,11 @@ pub struct KernelState {
     /// to collect iopub output and the shell reply without going through
     /// the WebSocket.
     pub rpc_listeners: HashMap<String, mpsc::UnboundedSender<JupyterMessage>>,
+
+    /// The status the kernel had when it was marked offline, while it is
+    /// offline. It is the status the kernel is given back when its heartbeat
+    /// returns.
+    status_before_offline: Option<models::Status>,
 }
 
 impl KernelState {
@@ -128,6 +133,7 @@ impl KernelState {
             kernel_info: None,
             resource_usage: None,
             rpc_listeners: HashMap::new(),
+            status_before_offline: None,
         }
     }
 
@@ -194,6 +200,43 @@ impl KernelState {
         }
     }
 
+    /// The kernel answers its heartbeat again after it was marked offline:
+    /// give it back the status it had before.
+    ///
+    /// Does nothing if the status has changed since the kernel was marked
+    /// offline. A status the kernel has reported itself meanwhile, or its
+    /// exit, is newer than what is remembered here.
+    pub async fn restore_status_after_offline(&mut self) {
+        if self.status != models::Status::Offline {
+            return;
+        }
+        let status = self
+            .status_before_offline
+            .take()
+            .unwrap_or(models::Status::Idle);
+        self.set_status(
+            status,
+            Some(String::from("heartbeat detected after offline")),
+        )
+        .await;
+    }
+
+    /// The kernel has given its first answer while it is marked offline.
+    ///
+    /// If its heartbeat was lost while it was still starting, the status to
+    /// come back to is no longer a starting one: the answer is what ends the
+    /// start, and nothing else would move the session on from there.
+    pub fn first_answer_while_offline(&mut self) {
+        if matches!(
+            self.status_before_offline,
+            Some(
+                models::Status::Uninitialized | models::Status::Starting | models::Status::Ready
+            )
+        ) {
+            self.status_before_offline = Some(models::Status::Idle);
+        }
+    }
+
     /// Set the kernel's status.
     pub async fn set_status(&mut self, status: models::Status, reason: Option<String>) {
         log::debug!(
@@ -217,8 +260,14 @@ impl KernelState {
         // shutdown_request) resurrect it into a running state. Coming back to
         // life only happens via an explicit restart, which moves the status
         // through 'starting' first.
+        //
+        // The same goes for a heartbeat that timed out just as the kernel
+        // exited: a kernel that has exited is not offline.
         if self.status == models::Status::Exited
-            && matches!(status, models::Status::Idle | models::Status::Busy)
+            && matches!(
+                status,
+                models::Status::Idle | models::Status::Busy | models::Status::Offline
+            )
         {
             log::debug!(
                 "[session {}] Ignoring status '{}' => '{}'; kernel has already exited",
@@ -228,6 +277,14 @@ impl KernelState {
             );
             return;
         }
+
+        // Going offline, remember the status to come back to. Any other
+        // change of status says more about the kernel than that does.
+        self.status_before_offline = if status == models::Status::Offline {
+            Some(self.status)
+        } else {
+            None
+        };
 
         self.status = status;
 
@@ -276,5 +333,97 @@ impl KernelState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use models::Status;
+
+    /// A kernel state in the given status, with the receiving ends of its
+    /// channels (which have to outlive it).
+    async fn state_in(
+        status: Status,
+    ) -> (
+        KernelState,
+        mpsc::Receiver<Option<u32>>,
+        async_channel::Receiver<WebsocketMessage>,
+    ) {
+        let session = models::NewSession {
+            session_id: "kernel-state-test".to_string(),
+            display_name: "Test".to_string(),
+            language: "test".to_string(),
+            username: "test".to_string(),
+            input_prompt: ">".to_string(),
+            continuation_prompt: "+".to_string(),
+            notebook_uri: None,
+            workspace_id: None,
+            session_mode: models::SessionMode::Console,
+            argv: vec![],
+            working_directory: String::new(),
+            env: vec![],
+            connection_timeout: None,
+            interrupt_mode: models::InterruptMode::Message,
+            protocol_version: None,
+            startup_environment: models::StartupEnvironment::None,
+            startup_environment_arg: None,
+        };
+        let (idle_nudge_tx, idle_nudge_rx) = mpsc::channel(64);
+        let (ws_json_tx, ws_json_rx) = async_channel::unbounded();
+        let mut state = KernelState::new(session, String::new(), idle_nudge_tx, ws_json_tx);
+        state.set_status(status, None).await;
+        (state, idle_nudge_rx, ws_json_rx)
+    }
+
+    #[tokio::test]
+    async fn a_kernel_back_from_offline_has_the_status_it_had() {
+        let (mut state, _nudges, _messages) = state_in(Status::Busy).await;
+        state.set_status(Status::Offline, None).await;
+        state.restore_status_after_offline().await;
+        assert_eq!(state.status, Status::Busy);
+    }
+
+    #[tokio::test]
+    async fn a_status_reported_while_offline_is_kept() {
+        let (mut state, _nudges, _messages) = state_in(Status::Busy).await;
+        state.set_status(Status::Offline, None).await;
+        state.set_status(Status::Idle, None).await;
+        state.restore_status_after_offline().await;
+        assert_eq!(state.status, Status::Idle);
+
+        // ... and what was remembered for that outage is not used for the next
+        state.set_status(Status::Starting, None).await;
+        state.set_status(Status::Offline, None).await;
+        state.restore_status_after_offline().await;
+        assert_eq!(state.status, Status::Starting);
+    }
+
+    #[tokio::test]
+    async fn a_first_answer_while_offline_ends_the_start() {
+        let (mut state, _nudges, _messages) = state_in(Status::Starting).await;
+        state.set_status(Status::Offline, None).await;
+        state.first_answer_while_offline();
+        assert_eq!(state.status, Status::Offline);
+        state.restore_status_after_offline().await;
+        assert_eq!(state.status, Status::Idle);
+    }
+
+    #[tokio::test]
+    async fn a_first_answer_while_offline_leaves_a_busy_kernel_busy() {
+        let (mut state, _nudges, _messages) = state_in(Status::Busy).await;
+        state.set_status(Status::Offline, None).await;
+        state.first_answer_while_offline();
+        state.restore_status_after_offline().await;
+        assert_eq!(state.status, Status::Busy);
+    }
+
+    #[tokio::test]
+    async fn a_kernel_that_has_exited_is_not_marked_offline() {
+        let (mut state, _nudges, _messages) = state_in(Status::Exited).await;
+        state.set_status(Status::Offline, None).await;
+        assert_eq!(state.status, Status::Exited);
+        state.restore_status_after_offline().await;
+        assert_eq!(state.status, Status::Exited);
     }
 }

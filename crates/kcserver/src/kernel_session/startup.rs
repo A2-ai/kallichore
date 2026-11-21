@@ -390,6 +390,11 @@ impl StartupCoordinator {
                         Some(String::from("kernel_info_reply received")),
                     )
                     .await;
+            } else if state.status == models::Status::Offline {
+                // The kernel answered no heartbeat for a while as it started,
+                // and is marked offline. It stays so until its heartbeat is
+                // back, and then goes to idle rather than back to starting.
+                state.first_answer_while_offline();
             }
         }
 
