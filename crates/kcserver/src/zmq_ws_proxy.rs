@@ -15,11 +15,11 @@ use kcshared::{
     kernel_message::KernelMessage,
     websocket_message::WebsocketMessage,
 };
-use std::{str::FromStr, sync::Arc};
+use std::{str::FromStr, sync::Arc, time::Duration};
 use tokio::{select, sync::RwLock};
 use zeromq::{
     util::PeerIdentity, DealerSocket, Socket, SocketEvent, SocketOptions, SocketRecv, SocketSend,
-    SubSocket, ZmqMessage,
+    SubSocket, ZmqError, ZmqMessage, ZmqResult,
 };
 
 use crate::{
@@ -48,6 +48,29 @@ pub struct ZmqWsProxy {
     pub disconnected_event: Arc<Event>,
     pub state: Arc<RwLock<KernelState>>,
     pub pending_iopub_messages: Vec<ZmqMessage>,
+}
+
+/// How long one attempt to connect to one of a kernel's sockets may take
+/// before a new attempt is made.
+///
+/// The kernel has usually only just been started and may not have bound its
+/// ports yet, so the first attempts are refused. ZeroMQ tries again by itself,
+/// with a pause that doubles after each refusal (up to 30 s), so a kernel that
+/// needs a few seconds to bind is reached long after it is ready. Ending each
+/// attempt after a short time and starting a new one keeps the pause short.
+const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(250);
+
+/// Connects a socket to one of a kernel's endpoints, making a new attempt
+/// whenever one times out (see `CONNECT_ATTEMPT_TIMEOUT`). This does not give
+/// up by itself; the caller bounds it with the session's connection timeout
+/// and ends it if the kernel exits.
+async fn connect_with_retries<S: Socket>(socket: &mut S, endpoint: &str) -> ZmqResult<()> {
+    loop {
+        match socket.connect(endpoint).await {
+            Err(ZmqError::ConnectTimeout(_)) => continue,
+            result => return result,
+        }
+    }
 }
 
 impl ZmqWsProxy {
@@ -81,7 +104,7 @@ impl ZmqWsProxy {
             shell_socket: Some(DealerSocket::with_options(ZmqWsProxy::dealer_peer_opts(
                 session_id.clone(),
             ))),
-            iopub_socket: Some(SubSocket::new()),
+            iopub_socket: Some(SubSocket::with_options(ZmqWsProxy::socket_opts())),
             control_socket: Some(DealerSocket::with_options(ZmqWsProxy::dealer_peer_opts(
                 session_id.clone(),
             ))),
@@ -111,10 +134,19 @@ impl ZmqWsProxy {
         }
     }
 
+    /// Creates the socket options shared by the sockets connected to the
+    /// kernel: each connection attempt is bounded, so that it can be made again
+    /// (see `connect_with_retries`).
+    fn socket_opts() -> SocketOptions {
+        let mut opts = SocketOptions::default();
+        opts.connect_timeout(CONNECT_ATTEMPT_TIMEOUT);
+        opts
+    }
+
     /// Creates the socket options for DEALER sockets to set the peer identity
     /// to the session ID.
     fn dealer_peer_opts(session_id: String) -> SocketOptions {
-        let mut peer_opts = SocketOptions::default();
+        let mut peer_opts = ZmqWsProxy::socket_opts();
         let peer_id = PeerIdentity::from_str(session_id.as_str()).unwrap();
         peer_opts.peer_identity(peer_id);
         peer_opts
@@ -138,17 +170,15 @@ impl ZmqWsProxy {
             self.connection_file.info.stdin_port,
         );
 
-        self.shell_socket
-            .as_mut()
-            .unwrap()
-            .connect(
-                format!(
-                    "tcp://{}:{}",
-                    self.connection_file.info.ip, self.connection_file.info.shell_port
-                )
-                .as_str(),
+        connect_with_retries(
+            self.shell_socket.as_mut().unwrap(),
+            format!(
+                "tcp://{}:{}",
+                self.connection_file.info.ip, self.connection_file.info.shell_port
             )
-            .await?;
+            .as_str(),
+        )
+        .await?;
 
         log::trace!(
             "[session {}] Connected to shell socket on port {}",
@@ -156,17 +186,15 @@ impl ZmqWsProxy {
             self.connection_file.info.shell_port
         );
 
-        self.iopub_socket
-            .as_mut()
-            .unwrap()
-            .connect(
-                format!(
-                    "tcp://{}:{}",
-                    self.connection_file.info.ip, self.connection_file.info.iopub_port
-                )
-                .as_str(),
+        connect_with_retries(
+            self.iopub_socket.as_mut().unwrap(),
+            format!(
+                "tcp://{}:{}",
+                self.connection_file.info.ip, self.connection_file.info.iopub_port
             )
-            .await?;
+            .as_str(),
+        )
+        .await?;
         log::trace!(
             "[session {}] Connected to iopub socket on port {}",
             self.connection.session_id,
@@ -176,34 +204,30 @@ impl ZmqWsProxy {
         // Subscribe to all messages
         self.iopub_socket.as_mut().unwrap().subscribe("").await?;
 
-        self.control_socket
-            .as_mut()
-            .unwrap()
-            .connect(
-                format!(
-                    "tcp://{}:{}",
-                    self.connection_file.info.ip, self.connection_file.info.control_port
-                )
-                .as_str(),
+        connect_with_retries(
+            self.control_socket.as_mut().unwrap(),
+            format!(
+                "tcp://{}:{}",
+                self.connection_file.info.ip, self.connection_file.info.control_port
             )
-            .await?;
+            .as_str(),
+        )
+        .await?;
         log::trace!(
             "[session {}] Connected to control socket on port {}",
             self.connection.session_id,
             self.connection_file.info.control_port
         );
 
-        self.stdin_socket
-            .as_mut()
-            .unwrap()
-            .connect(
-                format!(
-                    "tcp://{}:{}",
-                    self.connection_file.info.ip, self.connection_file.info.stdin_port
-                )
-                .as_str(),
+        connect_with_retries(
+            self.stdin_socket.as_mut().unwrap(),
+            format!(
+                "tcp://{}:{}",
+                self.connection_file.info.ip, self.connection_file.info.stdin_port
             )
-            .await?;
+            .as_str(),
+        )
+        .await?;
         log::trace!(
             "[session {}] Connected to stdin socket on port {}",
             self.connection.session_id,
