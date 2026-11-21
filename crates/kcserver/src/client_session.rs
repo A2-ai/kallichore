@@ -28,7 +28,11 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::kernel_connection::KernelConnection;
 use crate::kernel_state::KernelState;
-use event_listener::Event;
+use tokio_util::sync::CancellationToken;
+
+/// How long a client that another is taking the place of is given to take
+/// the message that says so. Its connection is closed after that either way.
+const FAREWELL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[derive(Clone)]
 pub struct ClientSession {
@@ -47,9 +51,11 @@ pub struct ClientSession {
     /// The current state of the kernel
     state: Arc<RwLock<KernelState>>,
 
-    /// An event that can be triggered to disconnect the session; used when we
-    /// need to reconnect a new client to the same kernel.
-    pub disconnect: Arc<Event>,
+    /// Cancelled to disconnect the client; used when another client connects
+    /// to the same kernel. It stays cancelled, so a handler that was busy
+    /// when its client was replaced (in the middle of a write to a client
+    /// that has stopped reading, say) still finds out.
+    pub disconnect: CancellationToken,
 
     /// The Unix domain socket path associated with this session, if any
     pub socket_path: Option<String>,
@@ -80,7 +86,7 @@ impl ClientSession {
             ws_zmq_tx,
             client_id: session_id,
             state,
-            disconnect: Arc::new(Event::new()),
+            disconnect: CancellationToken::new(),
             socket_path,
         }
     }
@@ -152,11 +158,68 @@ impl ClientSession {
             } else {
                 log::info!("[client {}] Connecting to websocket", self.client_id);
             }
-            state.set_connected(true).await;
-            // Set the client socket path in the kernel state
-            state.set_client_socket_path(self.socket_path.clone());
+            // This client is now the session's client
+            state
+                .client_connected(&self.client_id, self.socket_path.clone())
+                .await;
         }
 
+        // Serve the client until its connection ends, or until another
+        // client takes its place, whatever the serving is doing at that
+        // moment.
+        select! {
+            biased;
+            _ = self.disconnect.cancelled() => {},
+            _ = self.serve(&mut ws_stream) => {},
+        }
+
+        if self.disconnect.is_cancelled() {
+            // Another client is connecting to the same kernel. Tell this one
+            // and close its websocket, if it takes that in time: it may be
+            // gone, or not reading.
+            log::info!("[client {}] Disconnecting", self.client_id);
+            let farewell = async {
+                let close_msg = WebsocketMessage::Kernel(KernelMessage::ClientDisconnected(
+                    "Another client is connecting to this session.".to_string(),
+                ));
+                if let Ok(close_msg) = serde_json::to_string(&close_msg) {
+                    ws_stream.send(Message::Text(close_msg)).await?;
+                }
+                ws_stream.send(Message::Close(None)).await
+            };
+            match tokio::time::timeout(FAREWELL_TIMEOUT, farewell).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    log::debug!(
+                        "[client {}] Could not tell the client it was disconnected: {}",
+                        self.client_id,
+                        e
+                    );
+                }
+                Err(_) => {
+                    log::debug!(
+                        "[client {}] The client did not take the message that it was disconnected within {:?}",
+                        self.client_id,
+                        FAREWELL_TIMEOUT
+                    );
+                }
+            }
+        }
+
+        // Mark the session as disconnected, unless another client has taken
+        // this one's place: the session is then connected, to that client.
+        {
+            let mut state = self.state.write().await;
+            state.client_disconnected(&self.client_id);
+        }
+    }
+
+    /// Passes messages between a client's websocket and the kernel until the
+    /// websocket is closed or fails, or the client stops answering pings.
+    async fn serve<S>(&self, ws_stream: &mut WebSocketStream<S>)
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
         // Interval timer for client pings
         let mut tick = tokio::time::interval(tokio::time::Duration::from_secs(10));
 
@@ -166,6 +229,10 @@ impl ClientSession {
 
         // Loop to handle messages from the websocket and the ZMQ channel
         loop {
+            // A client that has been replaced takes no further message
+            if self.disconnect.is_cancelled() {
+                break;
+            }
             select! {
                 from_socket = ws_stream.next() => {
                     let message = match from_socket {
@@ -229,15 +296,18 @@ impl ClientSession {
                     match json {
                         Ok(json) => {
                             let json = serde_json::to_string(&json).unwrap();
-                            match ws_stream.send(Message::text(json)).await {
-                                Ok(_) => {}
-                                Err(e) => {
-                                    log::error!("Failed to send message to websocket: {}", e);
-                                }
+                            // A websocket that cannot be written to is
+                            // over. Going on would take the kernel's next
+                            // messages one by one and lose each, when they
+                            // could wait for the next client.
+                            if let Err(e) = ws_stream.send(Message::text(json)).await {
+                                log::error!("[client {}] Failed to send message to websocket: {}; closing", self.client_id, e);
+                                break;
                             }
                         },
                         Err(e) => {
-                            log::error!("Failed to receive websocket message: {}", e);
+                            log::error!("[client {}] Failed to receive websocket message: {}; closing", self.client_id, e);
+                            break;
                         }
                     }
                 },
@@ -262,32 +332,7 @@ impl ClientSession {
                         }
                     }
                 },
-                _ = self.disconnect.listen() => {
-                    // This event is fired when we need to disconnect the
-                    // session because another client is connecting to the same
-                    // kernel. We need to send a message to the client and close
-                    // the websocket.
-                    log::info!("[client {}] Disconnecting", self.client_id);
-
-                    // Create a message to send to the client
-                    let close_msg = WebsocketMessage::Kernel(KernelMessage::ClientDisconnected("Another client is connecting to this session.".to_string()));
-                    let close_msg = serde_json::to_string(&close_msg).unwrap();
-                    ws_stream.send(Message::Text(close_msg)).await.unwrap();
-
-                    // Send a close message to the websocket
-                    ws_stream.send(Message::Close(None)).await.unwrap();
-
-                    break;
-                }
             }
-        }
-
-        // Mark the session as disconnected
-        {
-            let mut state = self.state.write().await;
-            state.connected = false;
-            // Clear the client socket path when disconnecting
-            state.set_client_socket_path(None);
         }
     }
 
@@ -753,7 +798,7 @@ impl ClientSession {
         }
 
         // Notify that this client is disconnecting
-        self.disconnect.notify(usize::MAX);
+        self.disconnect.cancel();
 
         log::info!("[client {}] Named pipe connection closed", self.client_id);
     }
