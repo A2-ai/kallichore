@@ -47,9 +47,13 @@ impl ConnectionManager {
     /// Update the connection file for this kernel session.
     ///
     /// Used when connection details become available after handshaking.
+    ///
+    /// The ports of a connection file that `ensure_connection_file` generated
+    /// earlier are released: that file is replaced by this one.
     pub async fn update_connection_file(&self, connection_file: ConnectionFile) {
         let mut state = self.state.write().await;
         state.connection_file = Some(connection_file);
+        state.connection_file_ports = None;
     }
 
     /// Get the current connection file, if available.
@@ -69,13 +73,18 @@ impl ConnectionManager {
                 Ok(connection_file)
             }
             None => {
-                // Generate a new connection file
-                let connection_file = ConnectionFile::generate(
+                // Generate a new connection file. Its ports stay reserved
+                // for as long as the session keeps this file.
+                let (connection_file, reservation) = ConnectionFile::generate(
                     "127.0.0.1".to_string(),
                     self.reserved_ports.clone(),
                     self.connection_key.clone(),
                 )?;
-                self.update_connection_file(connection_file.clone()).await;
+                {
+                    let mut state = self.state.write().await;
+                    state.connection_file = Some(connection_file.clone());
+                    state.connection_file_ports = Some(reservation);
+                }
                 log::debug!(
                     "[session {}] Generated connection file with ports: shell={}, iopub={}, stdin={}, control={}, hb={}",
                     self.session_id,

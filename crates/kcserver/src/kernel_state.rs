@@ -17,7 +17,7 @@ use kcshared::{
 };
 use tokio::sync::mpsc;
 
-use crate::connection_file::ConnectionFile;
+use crate::connection_file::{ConnectionFile, PortReservation};
 use crate::execution_history::ExecutionHistory;
 use crate::execution_queue::ExecutionQueue;
 
@@ -82,6 +82,12 @@ pub struct KernelState {
     /// The connection file for the kernel, or None if not set.
     pub connection_file: Option<ConnectionFile>,
 
+    /// The reservation of the ports in a connection file that was generated
+    /// before the kernel was started, because a client asked for the
+    /// connection information early. The ports are released when that
+    /// connection file is replaced, or when the session is dropped.
+    pub connection_file_ports: Option<PortReservation>,
+
     /// The Unix domain socket path for the current client, if any.
     pub client_socket_path: Option<String>,
 
@@ -129,6 +135,7 @@ impl KernelState {
             idle_since: Some(std::time::Instant::now()),
             busy_since: None,
             connection_file: None,
+            connection_file_ports: None,
             client_socket_path: None,
             kernel_info: None,
             resource_usage: None,
