@@ -304,8 +304,7 @@ async fn check_failed_handshake_releases_the_registration_port(kernel_command: &
     );
 
     // The file the kernel was given names the port
-    let registration_file =
-        std::env::temp_dir().join(format!("registration_{}.json", session_id));
+    let registration_file = std::env::temp_dir().join(format!("registration_{}.json", session_id));
     let registration: serde_json::Value = serde_json::from_str(
         &std::fs::read_to_string(&registration_file).expect("the registration file should exist"),
     )

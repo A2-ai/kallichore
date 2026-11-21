@@ -30,6 +30,7 @@ mod kernel_connection;
 mod kernel_session;
 mod kernel_state;
 mod mcp;
+mod private_file;
 mod process_control;
 mod process_metrics;
 mod process_tree;
