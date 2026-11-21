@@ -349,11 +349,22 @@ impl KernelSession {
             }
         };
 
+        // A kernel that was given its ports in a connection file may not
+        // have bound them yet; one that did the handshake reported ports it
+        // had bound
+        let wait_for_ports = port_reservation.is_some();
+
         let startup_proxy_tx = startup_tx.clone();
         tokio::spawn(async move {
             let connection = kernel.connection.clone();
             kernel
-                .start_zmq_proxy(connection_file, connection, startup_proxy_tx, None)
+                .start_zmq_proxy(
+                    connection_file,
+                    connection,
+                    startup_proxy_tx,
+                    None,
+                    wait_for_ports,
+                )
                 .await;
 
             // The proxy for this kernel has ended, whichever way it ended:
@@ -577,7 +588,13 @@ impl KernelSession {
             );
 
             kernel
-                .start_zmq_proxy(connection_file, connection, startup_tx, Some(waiting_rx))
+                .start_zmq_proxy(
+                    connection_file,
+                    connection,
+                    startup_tx,
+                    Some(waiting_rx),
+                    false,
+                )
                 .await;
 
             log::debug!(
@@ -732,12 +749,16 @@ impl KernelSession {
     /// answer by then ends, and closes its sockets, without anything being
     /// sent to the kernel. A proxy left waiting would go on to forward
     /// messages for an adoption its caller has written off.
+    ///
+    /// `wait_for_ports` is passed to `ZmqWsProxy::connect`: whether the
+    /// kernel may not have bound its ports yet.
     async fn start_zmq_proxy(
         &self,
         connection_file: ConnectionFile,
         connection: KernelConnection,
         status_tx: Sender<StartupStatus>,
         adoption_waiter: Option<tokio::sync::oneshot::Receiver<()>>,
+        wait_for_ports: bool,
     ) {
         use crate::{error::KSError, zmq_ws_proxy::ZmqWsProxy};
 
@@ -779,7 +800,7 @@ impl KernelSession {
         // Wait for either the proxy to connect or for the session to exit
         let connect_or_exit = async {
             tokio::select! {
-                result = proxy.connect() => {
+                result = proxy.connect(wait_for_ports) => {
                     match result {
                         Ok(_) => Ok(()),
                         Err(e) => Err(KSError::SessionConnectionFailed(e)),

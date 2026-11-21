@@ -521,11 +521,19 @@ async fn test_execution_events_are_buffered_until_the_client_reconnects() {
         .await;
     assert!(!result.is_error, "{:?}", result);
 
+    // The execution's own output. It need not be the first stream message:
+    // what the kernel wrote as it started arrives the same way, if the
+    // supervisor had subscribed by then.
+    let is_the_output = |message: &WebsocketMessage| {
+        matches!(message, WebsocketMessage::Jupyter(msg)
+            if msg.header.msg_type == "stream"
+                && msg.content["text"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("while you were out")))
+    };
+
     let mut ws = connect_session_ws(&server, &session_id).await;
-    let messages = collect_until(&mut ws, Duration::from_secs(10), |message| {
-        matches!(message, WebsocketMessage::Jupyter(msg) if msg.header.msg_type == "stream")
-    })
-    .await;
+    let messages = collect_until(&mut ws, Duration::from_secs(10), is_the_output).await;
 
     let announced_at = messages
         .iter()
@@ -538,22 +546,12 @@ async fn test_execution_events_are_buffered_until_the_client_reconnects() {
         .expect("The buffered attribution event should arrive on reconnect");
     let streamed_at = messages
         .iter()
-        .position(|message| {
-            matches!(message, WebsocketMessage::Jupyter(msg) if msg.header.msg_type == "stream")
-        })
+        .position(is_the_output)
         .expect("The buffered output should arrive on reconnect");
     assert!(
         announced_at < streamed_at,
         "Buffered messages should be replayed in order"
     );
-
-    let WebsocketMessage::Jupyter(stream) = &messages[streamed_at] else {
-        unreachable!()
-    };
-    assert!(stream.content["text"]
-        .as_str()
-        .unwrap()
-        .contains("while you were out"));
 }
 
 #[tokio::test]
