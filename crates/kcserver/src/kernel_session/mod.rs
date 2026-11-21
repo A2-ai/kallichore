@@ -29,9 +29,13 @@ use kcshared::{jupyter_message::JupyterMessage, websocket_message::WebsocketMess
 use tokio::sync::RwLock;
 
 use crate::{
-    connection_file::ConnectionFile, execution_history::RECENT_ENTRIES,
-    kernel_connection::KernelConnection, kernel_state::KernelState, mcp::McpState,
-    registration_socket::RegistrationSocket, startup_status::StartupStatus,
+    connection_file::{ConnectionFile, PortReservation},
+    execution_history::RECENT_ENTRIES,
+    kernel_connection::KernelConnection,
+    kernel_state::KernelState,
+    mcp::McpState,
+    registration_socket::RegistrationSocket,
+    startup_status::StartupStatus,
 };
 
 use connection::ConnectionManager;
@@ -244,7 +248,7 @@ impl KernelSession {
         // whose exit would take the session out of the starting state, so
         // this does: a session left as starting can not be deleted, and reads
         // as one whose kernel is on its way.
-        let (child, registration) = match self
+        let (child, registration, port_reservation) = match self
             .launch_process(&mut coordinator, &working_directory, jep66_enabled)
             .await
         {
@@ -349,8 +353,12 @@ impl KernelSession {
         tokio::spawn(async move {
             let connection = kernel.connection.clone();
             kernel
-                .start_zmq_proxy(connection_file.clone(), connection, startup_proxy_tx, None)
+                .start_zmq_proxy(connection_file, connection, startup_proxy_tx, None)
                 .await;
+
+            // The proxy for this kernel has ended, whichever way it ended:
+            // the ports picked for the kernel are no longer kept from others
+            drop(port_reservation);
         });
 
         // Wait for the kernel to connect
@@ -373,16 +381,25 @@ impl KernelSession {
     /// kernel's process: the connection or registration file, the
     /// environment, the command.
     ///
-    /// Returns the process and, for a kernel that performs the JEP 66
-    /// handshake, the socket it will register on.
+    /// Returns the process, and one of two things: for a kernel that
+    /// performs the JEP 66 handshake, the socket it will register on; for
+    /// any other, the reservation of the ports picked for it. When this
+    /// fails after the ports were picked, they are released.
     async fn launch_process(
         &self,
         coordinator: &mut StartupCoordinator,
         working_directory: &str,
         jep66_enabled: bool,
-    ) -> Result<(tokio::process::Child, Option<RegistrationSocket>), StartupError> {
+    ) -> Result<
+        (
+            tokio::process::Child,
+            Option<RegistrationSocket>,
+            Option<PortReservation>,
+        ),
+        StartupError,
+    > {
         // Set up connection or registration file
-        let (connection_file_path, registration) = if jep66_enabled {
+        let (connection_file_path, registration, port_reservation) = if jep66_enabled {
             log::info!(
                 "[session {}] Kernel supports JEP 66 (protocol version {}) - creating registration socket for handshake",
                 self.connection.session_id,
@@ -399,10 +416,10 @@ impl KernelSession {
             );
 
             let (path, socket) = handshake_coord.setup_registration_socket().await?;
-            (path, Some(socket))
+            (path, Some(socket), None)
         } else {
             // Traditional kernel - generate connection file
-            let connection_file = ConnectionFile::generate(
+            let (connection_file, port_reservation) = ConnectionFile::generate(
                 "127.0.0.1".to_string(),
                 self.reserved_ports.clone(),
                 self.connection.key.clone(),
@@ -425,7 +442,7 @@ impl KernelSession {
 
             // Write to disk
             let path = coordinator.write_connection_file(&connection_file, "connection")?;
-            (path, None)
+            (path, None, Some(port_reservation))
         };
 
         // Substitute connection file path in arguments
@@ -458,7 +475,7 @@ impl KernelSession {
             .spawn_kernel_process(&mut cmd, &resolved_env, &process_monitor)
             .await?;
 
-        Ok((child, registration))
+        Ok((child, registration, port_reservation))
     }
 
     /// Shutdown the kernel.
@@ -727,7 +744,7 @@ impl KernelSession {
         let launched = adoption_waiter.is_none();
 
         let mut proxy = ZmqWsProxy::new(
-            connection_file.clone(),
+            connection_file,
             connection,
             self.state.clone(),
             self.ws_json_tx.clone(),
@@ -865,21 +882,6 @@ impl KernelSession {
                 error.log();
             }
         }
-
-        // Release reserved ports
-        let mut reserved_ports = self.reserved_ports.write().unwrap();
-        reserved_ports.retain(|&port| {
-            port != connection_file.info.control_port
-                && port != connection_file.info.shell_port
-                && port != connection_file.info.stdin_port
-                && port != connection_file.info.iopub_port
-                && port != connection_file.info.hb_port
-        });
-        log::trace!(
-            "Released reserved ports for session {}; there are now {} reserved ports",
-            self.connection.session_id,
-            reserved_ports.len()
-        );
     }
 
     /// Collect any standard out and standard error messages that were sent
